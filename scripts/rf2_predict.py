@@ -28,12 +28,12 @@ def main(conf: HydraConfig) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     
-    done_list=util.get_done_list(conf)
+    done_set = set(util.get_done_list(conf)) if conf.inference.cautious else set()
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     preprocessor=Preprocess(pose_to_inference_RFinput, conf)
     predictor=AbPredictor(conf, preprocess_fn=preprocessor, device=device)
     for pose, tag in pu.pose_generator(conf):
-        if tag in done_list and conf.inference.cautious:
+        if conf.inference.cautious and tag in done_set:
             print(f'Skipping {tag} as output already exists')
             continue
         predictor(pose, tag)

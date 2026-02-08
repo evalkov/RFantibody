@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -42,7 +43,9 @@ parser.add_argument("-seqs_per_struct", type=int, default="1",
                     help="The number of sequences to generate for each structure (default: 1)")
 
 # ProteinMPNN Specific Arguments
-default_ckpt = os.path.join( os.path.dirname(__file__), '/home/weights/ProteinMPNN_v48_noise_0.2.pt')
+default_ckpt = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', 'weights', 'ProteinMPNN_v48_noise_0.2.pt')
+)
 parser.add_argument("-checkpoint_path", type=str, default=default_ckpt)
 parser.add_argument("-temperature", type=float, default=0.000001, help='An a3m file containing the MSA of your target')
 parser.add_argument("-augment_eps", type=float, default=0,
@@ -106,13 +109,22 @@ class ProteinMPNN_runner():
     def sequence_optimize(self, sample_feats: SampleFeatures) -> list[tuple[str, float]]:
         t0 = time.time()
 
-        # Once we have figured out pose I/O without Rosetta this will be easy to swap in
-        pdbfile = 'temp.pdb'
-        sample_feats.pose.dump_pdb(pdbfile)
-
-        feature_dict = mpnn_util.generate_seqopt_features(pdbfile, sample_feats.chains)
-
-        os.remove(pdbfile)
+        # Once we have figured out pose I/O without Rosetta this will be easy to swap in.
+        # Use unique temp files to avoid collisions when many workers run in parallel.
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.pdb',
+            prefix='proteinmpnn_',
+            dir=os.environ.get('TMPDIR', None),
+            delete=False,
+        ) as tmp_handle:
+            pdbfile = tmp_handle.name
+        try:
+            sample_feats.pose.dump_pdb(pdbfile)
+            feature_dict = mpnn_util.generate_seqopt_features(pdbfile, sample_feats.chains)
+        finally:
+            if os.path.exists(pdbfile):
+                os.remove(pdbfile)
 
         arg_dict = mpnn_util.set_default_args(self.seqs_per_struct, omit_AAs=self.omit_AAs, allow_x=self.allow_x)
         arg_dict['temperature'] = self.temperature
@@ -122,19 +134,18 @@ class ProteinMPNN_runner():
 
         fixed_positions_dict = {pdbfile[:-len('.pdb')]: sample_feats.fixed_res}
 
-        sequences = mpnn_util.generate_sequences(
-            self.mpnn_model,
-            self.device,
-            feature_dict,
-            arg_dict,
-            masked_chains,
-            visible_chains,
-            fixed_positions_dict=fixed_positions_dict
-        )
+        with torch.inference_mode():
+            sequences = mpnn_util.generate_sequences(
+                self.mpnn_model,
+                self.device,
+                feature_dict,
+                arg_dict,
+                masked_chains,
+                visible_chains,
+                fixed_positions_dict=fixed_positions_dict
+            )
         
         print( f"MPNN generated {len(sequences)} sequences in {int( time.time() - t0 )} seconds" ) 
-
-        print(f'sequence_optimize: {sequences}')
 
         return sequences
 
@@ -172,7 +183,7 @@ class ProteinMPNN_runner():
 
         seconds = int(time.time() - t0)
 
-        print(f"Struct: {pdb} reported success in {seconds} seconds")
+        print(f"Struct: {tag} reported success in {seconds} seconds")
 
 
 ####################
@@ -200,6 +211,5 @@ for pdb in struct_manager.iterate():
     # We are done with one pdb, record that we finished
     struct_manager.record_checkpoint(pdb)
     
-
 
 

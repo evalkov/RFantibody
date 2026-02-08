@@ -21,6 +21,7 @@ import pickle
 import random
 import re
 import time
+import sys
 
 import hydra
 import numpy as np
@@ -93,7 +94,7 @@ def main(conf: HydraConfig) -> None:
                 # Find the highest design number
                 indices = [-1]
                 for tag in tags:
-                    m = re.match('.*_(\d+)$', tag)
+                    m = re.match(r'.*_(\d+)$', tag)
                     if not m:
                         continue
                     m = m.groups()[0]
@@ -105,7 +106,7 @@ def main(conf: HydraConfig) -> None:
         indices = [-1]
         for e in existing:
             print(e)
-            m = re.match('.*_(\d+)\.pdb$', e)
+            m = re.match(r'.*_(\d+)\.pdb$', e)
             print(m)
             if not m:
                 continue
@@ -133,56 +134,70 @@ def main(conf: HydraConfig) -> None:
                 continue
 
         # to track hotspots through inference
-        failed=0
+        failed = 0
         while True:
+            write_trajectory = bool(sampler.inf_conf.write_trajectory)
+            terminate_step = conf.antibody.terminate_bad_targeting
 
             x_init, seq_init = sampler.sample_init()
-            denoised_xyz_stack = []
-            px0_xyz_stack = []
-            seq_stack = []
-            chi1_stack = []
+            denoised_xyz_stack = [] if write_trajectory else None
+            px0_xyz_stack = [] if write_trajectory else None
             plddt_stack = []
+            final_x_t = x_init
+            final_seq_t = seq_init
 
             x_t = torch.clone(x_init)
             seq_t = torch.clone(seq_init)
             # Loop over number of reverse diffusion time steps.
-            for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step-1, -1):
-                px0, x_t, seq_t, tors_t, plddt = sampler.sample_step(
-                    t=t, seq_t=seq_t, x_t=x_t, seq_init=seq_init, final_step=sampler.inf_conf.final_step)
-                px0_xyz_stack.append(px0)
-                denoised_xyz_stack.append(x_t)
-                seq_stack.append(seq_t)
-                chi1_stack.append(tors_t[:,:])
-                plddt_stack.append(plddt[0]) # remove singleton leading dimension
-                
-                print("Sequence of Hotspot Residues:","".join(conversion[i] for i in torch.argmax(seq_t, dim=1)[sampler.ab_item.hotspots]))
-                if conf.antibody.terminate_bad_targeting is not None:
-                    #TODO move to a separate function to avoid repetition
+            for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step - 1, -1):
+                px0, x_t, seq_t, _, plddt = sampler.sample_step(
+                    t=t, seq_t=seq_t, x_t=x_t, seq_init=seq_init, final_step=sampler.inf_conf.final_step
+                )
+                final_x_t = x_t
+                final_seq_t = seq_t
+                if write_trajectory:
+                    px0_xyz_stack.append(px0)
+                    denoised_xyz_stack.append(x_t)
+                plddt_stack.append(plddt[0])  # remove singleton leading dimension
+
+                # Only do the expensive targeting distance check on the requested timestep.
+                if terminate_step is not None and terminate_step == t:
+                    print(
+                        "Sequence of Hotspot Residues:",
+                        "".join(conversion[i] for i in torch.argmax(seq_t, dim=1)[sampler.ab_item.hotspots]),
+                    )
+                    # TODO: move to a separate function to avoid repetition
                     # Loop through the hotspots, find the closest loop residue by Cb distance
                     # And then average the distance over each of the hotspots. Report min and mean distance
-                    Cb = generate_Cbeta(N=px0[:,0], Ca=px0[:,1], C=px0[:,2])
-        
+                    Cb = generate_Cbeta(N=px0[:, 0], Ca=px0[:, 1], C=px0[:, 2])
+
                     # We are going to assume constructed Cb is identical to original Cb - NRB
-                    dist = torch.cdist(Cb[sampler.ab_item.hotspots], Cb[sampler.ab_item.loop_mask]) # [hotspot_L, loop_L]
+                    dist = torch.cdist(Cb[sampler.ab_item.hotspots], Cb[sampler.ab_item.loop_mask])  # [hotspot_L, loop_L]
 
-                    mindist = torch.min(dist, dim=1).values # The min distance for each hotspot
-    
-                    overallmin = torch.min(mindist) # The distance of the closest hotspot to a loop
+                    mindist = torch.min(dist, dim=1).values  # The min distance for each hotspot
 
-                    print(f'Overall min distance hotspot to designed loop: {overallmin}')
-                    if conf.antibody.terminate_bad_targeting == t and overallmin > conf.antibody.hotspot_termination_threshold:
+                    overallmin = torch.min(mindist)  # The distance of the closest hotspot to a loop
+
+                    print(f"Overall min distance hotspot to designed loop: {overallmin}")
+                    if overallmin > conf.antibody.hotspot_termination_threshold:
                         print("Not targeting correctly")
-                        failed+=1
-                        if failed>=conf.antibody.hotspot_termination_failures_permitted:
+                        failed += 1
+                        if failed >= conf.antibody.hotspot_termination_failures_permitted:
                             sys.exit("This set of inputs is not efficiently targeting the hotspots")
                         continue
+
             # break out of while loop
             break
-        # Flip order for better visualization in pymol
-        denoised_xyz_stack = torch.stack(denoised_xyz_stack)
-        denoised_xyz_stack = torch.flip(denoised_xyz_stack, [0,])
-        px0_xyz_stack = torch.stack(px0_xyz_stack)
-        px0_xyz_stack = torch.flip(px0_xyz_stack, [0,])
+
+        if write_trajectory:
+            # Flip order for better visualization in pymol
+            denoised_xyz_stack = torch.stack(denoised_xyz_stack)
+            denoised_xyz_stack = torch.flip(denoised_xyz_stack, [0])
+            px0_xyz_stack = torch.stack(px0_xyz_stack)
+            px0_xyz_stack = torch.flip(px0_xyz_stack, [0])
+            final_xyz = denoised_xyz_stack[0]
+        else:
+            final_xyz = final_x_t
 
         # For logging -- don't flip
         plddt_stack = torch.stack(plddt_stack)
@@ -191,7 +206,7 @@ def main(conf: HydraConfig) -> None:
         if sampler.inf_conf.quiver is None:
             os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
 
-        final_seq = seq_stack[-1]
+        final_seq = final_seq_t
 
         if conf.seq_diffuser.seqdiff is not None:
             # When doing sequence diffusion the model does not make predictions beyond category 19
@@ -226,7 +241,7 @@ def main(conf: HydraConfig) -> None:
         if sampler.ab_design() and torch.any(sampler.ab_item.target_mask) and torch.any(sampler.ab_item.hotspots):
             # Loop through the hotspots, find the closest loop residue by Cb distance
             # And then average the distance over each of the hotspots. Report min and mean distance
-            Cb = generate_Cbeta(N=denoised_xyz_stack[0,:,0], Ca=denoised_xyz_stack[0,:,1], C=denoised_xyz_stack[0,:,2])
+            Cb = generate_Cbeta(N=final_xyz[:,0], Ca=final_xyz[:,1], C=final_xyz[:,2])
 
             # We are going to assume constructed Cb is identical to original Cb - NRB
             dist = torch.cdist(Cb[sampler.ab_item.hotspots], Cb[sampler.ab_item.loop_mask]) # [hotspot_L, loop_L]
@@ -260,7 +275,7 @@ def main(conf: HydraConfig) -> None:
             if sampler.inf_conf.quiver is None:
                 # Write as PDB files
                 pdblines = ab_write_pdblines(
-                    atoms = denoised_xyz_stack[0,:,:4].cpu().numpy(),
+                    atoms = final_xyz[:,:4].cpu().numpy(),
                     seq = final_seq.cpu().numpy(),
                     chain_idx = sampler.chain_idx,
                     bfacts = bfacts.cpu().numpy(),
@@ -274,7 +289,7 @@ def main(conf: HydraConfig) -> None:
             else:
                 # Add to Quiver file
                 pdblines = ab_write_pdblines(
-                    atoms = denoised_xyz_stack[0,:,:4].cpu().numpy(),
+                    atoms = final_xyz[:,:4].cpu().numpy(),
                     seq = final_seq.cpu().numpy(),
                     chain_idx = sampler.chain_idx,
                     bfacts = bfacts.cpu().numpy(),
@@ -292,7 +307,7 @@ def main(conf: HydraConfig) -> None:
                     quiver.add_pdb(pdblines, outtag)
         else:
             # Now don't output sidechains
-            writepdb(out, denoised_xyz_stack[0,:,:4], final_seq, sampler.binderlen, chain_idx=sampler.chain_idx, bfacts=bfacts)
+            writepdb(out, final_xyz[:,:4], final_seq, sampler.binderlen, chain_idx=sampler.chain_idx, bfacts=bfacts)
 
         #### Write Trajectory
         ####################################

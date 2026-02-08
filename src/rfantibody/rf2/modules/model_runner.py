@@ -86,7 +86,10 @@ class AbPredictor(Predictor):
                     to_write['best'] = {'pose': best_pose, 'metrics': best_metrics}
                 if self.conf.output.output_intermediates:
                     to_write[i_cycle] = {'pose': output_pose_i, 'metrics': metrics_i}
-                torch.cuda.empty_cache()
+                # Emptying cache every recycle can reduce throughput because it
+                # forces allocator churn. Keep it optional for constrained runs.
+                if getattr(self.conf.inference, "empty_cache_each_cycle", False):
+                    torch.cuda.empty_cache()
         print(f"[RF2] Completed: {tag} - Best pLDDT: {best_lddt.mean():.3f}")
         write_output(to_write, tag, self.conf)
 
