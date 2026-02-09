@@ -206,6 +206,7 @@ def write_output(to_write: OrderedDict, tag: str, conf: HydraConfig) -> None:
     if sum([var is not None for var in [conf.output.pdb_dir, conf.output.quiver]]) != 1:
         raise ValueError('Exactly one of output.pdb_dir or output.quiver must be specified')
     qv=conf.output.quiver is not None
+    output_quiver = Quiver(f'{conf.output.quiver}', mode='w') if qv else None
     for key, val in to_write.items():
         if key == 'best':
             suffix = 'best'
@@ -217,7 +218,6 @@ def write_output(to_write: OrderedDict, tag: str, conf: HydraConfig) -> None:
         pose = pu.reorder_pose_to_HLT(pose)
         pdblines=pu.pose_to_remarked_pdblines(pose, metrics=metrics)
         if qv:
-            output_quiver=Quiver(f'{conf.output.quiver}', mode='w')
             # Filter out SCORE lines from pdblines - we'll add them via score_str
             pdblines_no_scores = [line for line in pdblines if not line.startswith('SCORE')]
             # Build score string in quiver format: key1=val1|key2=val2|...

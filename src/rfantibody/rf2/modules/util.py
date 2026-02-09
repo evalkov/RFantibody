@@ -184,7 +184,15 @@ def get_done_list(conf: HydraConfig) -> list:
         return [strip(i)[:-5] for i in glob.glob(f'{conf.output.pdb_dir}/*_best.pdb')]
     elif conf.output.quiver is not None:
         qv=Quiver(f'{conf.output.quiver}', mode='r')
-        return qv.tags
+        done = set()
+        for tag in qv.tags:
+            if tag.endswith('_best'):
+                done.add(tag[:-5])
+            elif '_cycle_' in tag:
+                done.add(tag.split('_cycle_', 1)[0])
+            else:
+                done.add(tag)
+        return sorted(done)
     else:
         raise ValueError('Must specify output.pdb_dir or output.quiver')
 

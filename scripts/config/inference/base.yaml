@@ -151,6 +151,7 @@ preprocess:
   
 logging:
   inputs: False
+  verbose: False
 
 scaffoldguided:
   scaffoldguided: False

@@ -1,6 +1,5 @@
 import glob
 import os
-import uuid
 
 from rfantibody.util.pose import Pose
 from rfantibody.util.quiver import Quiver
@@ -94,13 +93,22 @@ class StructManager():
         if self.chkfn is None:
             # Using quiver output - no checkpoint file needed
             return
+        normalized_tag = os.path.basename(str(tag)).split('.')[0]
         with open(self.chkfn, 'a') as f:
-            f.write(f'{tag}\n')
+            f.write(f'{normalized_tag}\n')
 
     def iterate(self) -> str:
         '''
         Iterate over the silent file or pdb directory and run the model on each structure
         '''
+
+        if self.input_quiver:
+            for tag, pdblines in self.inquiver.iter_structs():
+                if tag in self.finished_structs:
+                    print(f'{tag} has already been processed. Skipping')
+                    continue
+                yield (tag, pdblines)
+            return
 
         # Iterate over the structs and for each, check that the struct has not already been processed
         for struct in self.struct_iterator:
@@ -132,15 +140,19 @@ class StructManager():
             pdblines = pose.to_pdblines()
             self.outquiver.add_pdb(pdblines, tag)
 
-    def load_pose(self, tag: str) -> Pose:
+    def load_pose(self, source) -> Pose:
         '''
         Load a pose from either a pdb file or quiver file depending on the input arguments
         '''
 
         if self.input_pdb:
-            pose = Pose.from_pdb(tag)
+            pose = Pose.from_pdb(source)
         elif self.input_quiver:
-            pose = Pose.from_pdblines(self.inquiver.get_pdblines(tag))
+            if isinstance(source, tuple):
+                _, pdblines = source
+            else:
+                pdblines = self.inquiver.get_pdblines(source)
+            pose = Pose.from_pdblines(pdblines)
         else:
             raise Exception('Neither input_pdb nor input_quiver is set to True. Cannot load pose')
 

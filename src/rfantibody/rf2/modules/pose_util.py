@@ -407,10 +407,7 @@ def pose_generator(conf: HydraConfig) -> tuple[Pose, str]:
     
     if conf.input.quiver is not None:
         quiver=Quiver(conf.input.quiver, mode='r')
-        tags=quiver.get_tags()
-
-        for tag in tags:
-            pdblines=quiver.get_pdblines(tag)
+        for tag, pdblines in quiver.iter_structs():
             yield pose_from_pdblines(pdblines), tag
 
     elif conf.input.pdb is not None:

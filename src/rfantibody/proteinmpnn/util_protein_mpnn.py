@@ -229,7 +229,7 @@ def init_seq_optimize_model(device, hidden_dim, num_layers, backbone_noise, num_
    return model
 
 #def set_default_args( seq_per_target, omit_AAs=['X'], decoding_order='forward' ):
-def set_default_args( seq_per_target, omit_AAs=['X'], allow_x=False ):
+def set_default_args( seq_per_target, omit_AAs=['X'], allow_x=False, batch_size=1 ):
 
     #global DECODING_ORDER
     #DECODING_ORDER = decoding_order
@@ -240,8 +240,10 @@ def set_default_args( seq_per_target, omit_AAs=['X'], allow_x=False ):
         omit_AAs.append('X')
 
     retval = {}
-    retval['BATCH_COPIES'] = min( 1, seq_per_target )
-    retval['NUM_BATCHES'] = seq_per_target // retval['BATCH_COPIES']
+    effective_batch_size = max(1, min(int(batch_size), int(seq_per_target)))
+    retval['BATCH_COPIES'] = effective_batch_size
+    retval['NUM_BATCHES'] = int(np.ceil(seq_per_target / retval['BATCH_COPIES']))
+    retval['SEQ_PER_TARGET'] = int(seq_per_target)
     retval['temperature'] = 0.1
 
     omit_AAs_list = omit_AAs
@@ -324,4 +326,6 @@ def generate_sequences( model, device, feature_dict, arg_dict, masked_chains, vi
 
                 seqs_scores.append((seq,score))
 
+    if 'SEQ_PER_TARGET' in arg_dict:
+        seqs_scores = seqs_scores[:arg_dict['SEQ_PER_TARGET']]
     return seqs_scores

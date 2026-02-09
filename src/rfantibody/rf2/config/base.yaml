@@ -12,6 +12,7 @@ inference:
   num_recycles: 10
   hotspot_show_proportion: 0.1
   cautious: True
+  empty_cache_each_cycle: False
 
 model:
   model_weights: /home/weights/RF2_ab.pt
@@ -51,4 +52,3 @@ model_param:
     num_edge_features: 64
     div: 4
     n_heads: 4
-

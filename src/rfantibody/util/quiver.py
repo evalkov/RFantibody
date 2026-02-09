@@ -9,6 +9,7 @@
 
 import os
 import sys
+from typing import Iterator, Optional
 
 
 class Quiver():
@@ -24,6 +25,7 @@ class Quiver():
         self.backend = backend
 
         self.buffer = {}
+        self._tag_offsets = {}
 
         # Perform mode-specific operations
         if self.mode == 'w' or self.mode == 'r':
@@ -42,10 +44,15 @@ class Quiver():
             return tags
 
         with open(self.fn, 'r') as f:
-            for line in f:
-
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
                 if line.startswith('QV_TAG'):
-                    tags.append(''.join(line.split()[1:]))
+                    tag = ''.join(line.split()[1:])
+                    tags.append(tag)
+                    self._tag_offsets[tag] = offset
 
         return tags
 
@@ -76,6 +83,7 @@ class Quiver():
 
         # We could eventually have a buffering system here to avoid writing to disk every time
         with open(self.fn, 'a') as f:
+            offset = f.tell()
             f.write(f'QV_TAG {tag}\n')
             if score_str is not None:
                 f.write(f'QV_SCORE {tag} {score_str}\n')
@@ -83,6 +91,56 @@ class Quiver():
             f.write('\n')
         
         self.tags.append(tag)
+        self._tag_offsets[tag] = offset
+
+    def iter_structs(self, include_scores: bool = False) -> Iterator[tuple]:
+        '''
+            Iterates through all structures in a Quiver file in a single pass.
+
+            Inputs:
+                include_scores:
+                    If True, yield (tag, pdblines, score_str). Otherwise, yield (tag, pdblines).
+        '''
+
+        if self.mode == 'w':
+            sys.exit('Quiver file must be opened in read mode to allow iteration.')
+
+        if not os.path.exists(self.fn):
+            return
+
+        with open(self.fn, 'r') as f:
+            current_tag: Optional[str] = None
+            current_lines: list[str] = []
+            current_score: Optional[str] = None
+
+            for line in f:
+                if line.startswith('QV_TAG'):
+                    if current_tag is not None:
+                        if include_scores:
+                            yield current_tag, current_lines, current_score
+                        else:
+                            yield current_tag, current_lines
+                    current_tag = line.split()[1]
+                    current_lines = []
+                    current_score = None
+                    continue
+
+                if current_tag is None:
+                    continue
+
+                if line.startswith('QV_SCORE'):
+                    if include_scores:
+                        parts = line.split(maxsplit=2)
+                        current_score = parts[2].strip() if len(parts) > 2 else ''
+                    continue
+
+                current_lines.append(line)
+
+            if current_tag is not None:
+                if include_scores:
+                    yield current_tag, current_lines, current_score
+                else:
+                    yield current_tag, current_lines
 
     def get_pdblines(self, tag: str) -> list:
         '''
@@ -101,19 +159,24 @@ class Quiver():
             # We could in the future have this fail and return False
             sys.exit(f'Quiver file must be opened in read mode to allow for reading.')
         
-        with open(self.fn, 'r') as f:
-            for line in f:
-                if line.startswith('QV_TAG'):
-                    if tag == line.split()[1]:
-                        pdb_lines = []
-                        for line in f:
-                            if line.startswith('QV_SCORE'):
-                                continue
-                            if line.startswith('QV_TAG'):
-                                break
-                            pdb_lines.append(line)
+        if tag not in self._tag_offsets:
+            sys.exit(f'Requested tag: {tag} which does not exist')
 
-                        return pdb_lines
+        with open(self.fn, 'r') as f:
+            f.seek(self._tag_offsets[tag])
+            first_line = f.readline()
+            if not first_line.startswith('QV_TAG') or first_line.split()[1] != tag:
+                sys.exit(f'Requested tag: {tag} which does not exist')
+
+            pdb_lines = []
+            for line in f:
+                if line.startswith('QV_SCORE'):
+                    continue
+                if line.startswith('QV_TAG'):
+                    break
+                pdb_lines.append(line)
+
+            return pdb_lines
 
         # If we get here, we didn't find the tag
         sys.exit(f'Requested tag: {tag} which does not exist')
@@ -138,23 +201,18 @@ class Quiver():
             # We could in the future have this fail and return False
             sys.exit(f'Quiver file must be opened in read mode to allow for reading.')
 
+        wanted_tags = set(tag_list)
         found_tags = []
-        with open(self.fn, 'r') as f:
-            struct_list = []
-            for line in f:
-                if line.startswith('QV_TAG'):
-                    if line.split()[1] not in tag_list:
-                        continue
-                    # We have found a tag that we want to include
-                    # Keep going until we hit a tag that we don't want to include
-                    struct_list.append(line)
-                    found_tags.append(line.split()[1])
-                    for line in f:
-                        if line.startswith('QV_TAG'):
-                            if line.split()[1] not in tag_list:
-                                break
-                            found_tags.append(line.split()[1])
-                        struct_list.append(line)
+        struct_list = []
+
+        for tag, pdblines, score_str in self.iter_structs(include_scores=True):
+            if tag not in wanted_tags:
+                continue
+            found_tags.append(tag)
+            struct_list.append(f'QV_TAG {tag}\n')
+            if score_str is not None:
+                struct_list.append(f'QV_SCORE {tag} {score_str}\n')
+            struct_list.extend(pdblines)
 
         qv_string = ''.join(struct_list)
 

@@ -20,8 +20,8 @@ import os
 import pickle
 import random
 import re
-import time
 import sys
+import time
 
 import hydra
 import numpy as np
@@ -45,6 +45,7 @@ def make_deterministic(seed=0):
 @hydra.main(version_base=None, config_path='config/inference', config_name='base')
 def main(conf: HydraConfig) -> None:
     log = logging.getLogger(__name__)
+    verbose = bool(getattr(conf.logging, 'verbose', False)) if hasattr(conf, 'logging') else False
     if conf.inference.deterministic:
         make_deterministic()
 
@@ -79,6 +80,7 @@ def main(conf: HydraConfig) -> None:
     if sampler.inf_conf.quiver is not None:
 
         tags = quiver.get_tags()
+        existing_tag_set = set(tags)
 
         if sampler.inf_conf.design_startnum == -1:
 
@@ -105,9 +107,11 @@ def main(conf: HydraConfig) -> None:
         existing = glob.glob(sampler.inf_conf.output_prefix + '*.pdb')
         indices = [-1]
         for e in existing:
-            print(e)
+            if verbose:
+                log.info('Found existing output: %s', e)
             m = re.match(r'.*_(\d+)\.pdb$', e)
-            print(m)
+            if verbose:
+                log.info('Matched index regex: %s', m is not None)
             if not m:
                 continue
             m = m.groups()[0]
@@ -123,14 +127,15 @@ def main(conf: HydraConfig) -> None:
 
         start_time = time.time()
         out_prefix = f'{sampler.inf_conf.output_prefix}_{i_des}'
+        outtag = out_prefix.replace(os.sep, '_').replace('\\', '_')
         log.info(f'Making design {out_prefix}')
         if sampler.inf_conf.cautious and os.path.exists(out_prefix+'.pdb'):
             log.info(f'(cautious mode) Skipping this design because {out_prefix}.pdb already exists.')
             continue
 
         if sampler.inf_conf.quiver is not None:
-            if out_prefix in tags:
-                log.info(f'Skipping this design because tag {out_prefix} already exists.')
+            if outtag in existing_tag_set:
+                log.info(f'Skipping this design because tag {outtag} already exists.')
                 continue
 
         # to track hotspots through inference
@@ -162,10 +167,11 @@ def main(conf: HydraConfig) -> None:
 
                 # Only do the expensive targeting distance check on the requested timestep.
                 if terminate_step is not None and terminate_step == t:
-                    print(
-                        "Sequence of Hotspot Residues:",
-                        "".join(conversion[i] for i in torch.argmax(seq_t, dim=1)[sampler.ab_item.hotspots]),
-                    )
+                    if verbose:
+                        print(
+                            "Sequence of Hotspot Residues:",
+                            "".join(conversion[i] for i in torch.argmax(seq_t, dim=1)[sampler.ab_item.hotspots]),
+                        )
                     # TODO: move to a separate function to avoid repetition
                     # Loop through the hotspots, find the closest loop residue by Cb distance
                     # And then average the distance over each of the hotspots. Report min and mean distance
@@ -178,9 +184,11 @@ def main(conf: HydraConfig) -> None:
 
                     overallmin = torch.min(mindist)  # The distance of the closest hotspot to a loop
 
-                    print(f"Overall min distance hotspot to designed loop: {overallmin}")
+                    if verbose:
+                        print(f"Overall min distance hotspot to designed loop: {overallmin}")
                     if overallmin > conf.antibody.hotspot_termination_threshold:
-                        print("Not targeting correctly")
+                        if verbose:
+                            print("Not targeting correctly")
                         failed += 1
                         if failed >= conf.antibody.hotspot_termination_failures_permitted:
                             sys.exit("This set of inputs is not efficiently targeting the hotspots")
@@ -251,8 +259,9 @@ def main(conf: HydraConfig) -> None:
             overallmin = torch.min(mindist) # The distance of the closest hotspot to a loop
             averagemin = torch.mean(mindist) # The average distance of the hotspots to a loop
 
-            print(f'Overall min distance hotspot to designed loop: {overallmin}')
-            print(f'Average min distance hotspot to designed loop: {averagemin}')
+            if verbose:
+                print(f'Overall min distance hotspot to designed loop: {overallmin}')
+                print(f'Average min distance hotspot to designed loop: {averagemin}')
 
             trb['mindist']    = overallmin.cpu().numpy()
             trb['averagemin'] = averagemin.cpu().numpy()
@@ -297,14 +306,12 @@ def main(conf: HydraConfig) -> None:
                     num2aa = num2aa,
                 ) 
 
-                # Remove backslashes from out_prefix
-                outtag = out_prefix.replace('/', '_')
-
                 if torch.any(sampler.ab_item.target_mask) and torch.any(sampler.ab_item.hotspots):
                     scoreline = f'mindist={float(overallmin):.2f}|averagemin={float(averagemin):.2f}'
                     quiver.add_pdb(pdblines, outtag, scoreline)
                 else:
                     quiver.add_pdb(pdblines, outtag)
+                existing_tag_set.add(outtag)
         else:
             # Now don't output sidechains
             writepdb(out, final_xyz[:,:4], final_seq, sampler.binderlen, chain_idx=sampler.chain_idx, bfacts=bfacts)

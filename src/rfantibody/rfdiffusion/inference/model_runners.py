@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 
@@ -54,6 +55,7 @@ class Sampler:
 
         # Assign config to Sampler
         self._conf = conf
+        self.verbose = bool(getattr(self._conf.logging, 'verbose', False)) if hasattr(self._conf, 'logging') else False
 
         # Initialize inference only helper objects to Sampler
         # JW now added automatic model selection.
@@ -357,27 +359,32 @@ class AbSampler(Sampler):
 
         #### 1) Parse pdb to an ab_pose that can be easily manipulated
         ####################################################################
-        self.pose = ab_pose.AbPose()
+        if not hasattr(self, '_base_pose_cache'):
+            base_pose = ab_pose.AbPose()
 
-        # Determine which format the input structure has been provided
-        if self.inf_conf.input_pdb is not None:
-            assert(self.ab_conf.target_pdb is None and self.ab_conf.framework_pdb is None), \
-                    "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
+            # Determine which format the input structure has been provided
+            if self.inf_conf.input_pdb is not None:
+                assert(self.ab_conf.target_pdb is None and self.ab_conf.framework_pdb is None), \
+                        "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
 
-            self.pose.from_HLT(self.inf_conf.input_pdb)
+                base_pose.from_HLT(self.inf_conf.input_pdb)
 
-        assert(~((self.ab_conf.target_pdb is None) ^ (self.ab_conf.framework_pdb is None))), \
-                "Having antibody.target and not antibody.framework_pdb or vice versa is not currently supported."
+            assert(~((self.ab_conf.target_pdb is None) ^ (self.ab_conf.framework_pdb is None))), \
+                    "Having antibody.target and not antibody.framework_pdb or vice versa is not currently supported."
 
-        if self.ab_conf.target_pdb is not None and self.ab_conf.framework_pdb is not None:
-            assert(self.diffuser_conf.partial_T is None), \
-                    "Partial diffusion is only supported when using inference.input_pdb"
+            if self.ab_conf.target_pdb is not None and self.ab_conf.framework_pdb is not None:
+                assert(self.diffuser_conf.partial_T is None), \
+                        "Partial diffusion is only supported when using inference.input_pdb"
 
-            assert(self.inf_conf.input_pdb is None), \
-                    "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
+                assert(self.inf_conf.input_pdb is None), \
+                        "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
 
-            self.pose.framework_from_HLT(self.ab_conf.framework_pdb)
-            self.pose.target_from_HLT(self.ab_conf.target_pdb)
+                base_pose.framework_from_HLT(self.ab_conf.framework_pdb)
+                base_pose.target_from_HLT(self.ab_conf.target_pdb)
+
+            self._base_pose_cache = copy.deepcopy(base_pose)
+
+        self.pose = copy.deepcopy(self._base_pose_cache)
 
 
         #### 2) Adjust the length of the CDR loops in the AbPose
@@ -386,17 +393,20 @@ class AbSampler(Sampler):
         # If we are doing partial diffusion, we will skip the loop length adjustment step
         # Since we are just resampling from the starting scaffold
         if self.diffuser_conf.partial_T:
-           print("Partial diffusion detected, skipping loop length adjustment step") 
+            if self.verbose:
+                print("Partial diffusion detected, skipping loop length adjustment step")
 
         else:
             # We are doing full diffusion, so we need to adjust the loop lengths
-            ic(self.pose.length())
-            ic(self.pose.binder_len())
-            ic(self.pose.L.seq)
+            if self.verbose:
+                ic(self.pose.length())
+                ic(self.pose.binder_len())
+                ic(self.pose.L.seq)
             self.pose.adjust_loop_lengths(self.ab_conf.design_loops)
-            ic(self.pose.length())
-            ic(self.pose.binder_len())
-            ic(self.pose.L.seq)
+            if self.verbose:
+                ic(self.pose.length())
+                ic(self.pose.binder_len())
+                ic(self.pose.L.seq)
 
 
         #### 3) Assemble the ab_item for use downstream. Also determine which residues we should design
@@ -483,8 +493,9 @@ class AbSampler(Sampler):
 
         self.denoiser = self.construct_denoiser(self.L, visible=self.diffusion_mask)
 
-        ic(self.ab_item.loop_mask)
-        ic(self.ab_item.hotspots)
+        if self.verbose:
+            ic(self.ab_item.loop_mask)
+            ic(self.ab_item.hotspots)
         return xT, seq_T
 
     def _preprocess(self, seq, xyz_t, t):
@@ -559,7 +570,8 @@ class AbSampler(Sampler):
         if (t < self.diffuser.T) and (t != self.diffuser_conf.partial_T) \
             and self.preprocess_conf.selfcondition_msaprev and self.preprocess_conf.msaprev_bugfix:
 
-            ic('Providing Ab Seq Self Cond')
+            if self.verbose:
+                ic('Providing Ab Seq Self Cond')
             msa_prev = self.msa_prev
 
         else:
@@ -570,7 +582,8 @@ class AbSampler(Sampler):
         ##################################
         if (t < self.diffuser.T) and (t != self.diffuser_conf.partial_T):
 
-            ic('Providing Ab Str Self Cond')
+            if self.verbose:
+                ic('Providing Ab Str Self Cond')
             xyz_t, t2d, xyz_sc, sc2d = process_selfcond(self.prev_pred, t2d, xyz_t, self.ab_conf, xyz_t.device)
 
             # Correct selfcond now will detect from the checkpoint file whether it
@@ -587,10 +600,11 @@ class AbSampler(Sampler):
         else:
             # The non-selfcond step for antibodies is to just leave the input as-is
             sc2d, xyz_sc = process_init_selfcond(t2d, xyz_t, self.ab_conf, xyz_t.device)
-        
-        print('Monitoring target centering')
-        ic(xyz_t[0,0,self.diffusion_mask,1].mean(dim=0))
-        ic(xt_in[0,self.diffusion_mask,1].mean(dim=0))
+
+        if self.verbose:
+            print('Monitoring target centering')
+            ic(xyz_t[0,0,self.diffusion_mask,1].mean(dim=0))
+            ic(xt_in[0,self.diffusion_mask,1].mean(dim=0))
 
         with torch.no_grad():
             px0=xt_in
@@ -661,6 +675,3 @@ class AbSampler(Sampler):
             px0 = px0.to(x_t.device)
 
         return px0, x_t_1, seq_t_1, tors_t_1, plddt
-
-
-

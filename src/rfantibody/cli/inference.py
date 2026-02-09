@@ -177,6 +177,8 @@ def rfdiffusion(
               help='Loops to design (default: H1,H2,H3,L1,L2,L3)')
 @click.option('--seqs-per-struct', '-n', type=int, default=1,
               help='Number of sequences per structure (default: 1)')
+@click.option('--batch-size', type=int, default=1,
+              help='Number of sequence samples per GPU forward pass (default: 1)')
 @click.option('--temperature', '-t', type=float, default=0.1,
               help='Sampling temperature (default: 0.1)')
 @click.option('--weights', '-w', type=click.Path(exists=True, path_type=Path), default=None,
@@ -198,6 +200,7 @@ def proteinmpnn(
     output_quiver: Optional[Path],
     loops: str,
     seqs_per_struct: int,
+    batch_size: int,
     temperature: float,
     weights: Optional[Path],
     omit_aas: str,
@@ -230,6 +233,9 @@ def proteinmpnn(
         sys.exit(1)
     if input_dir is not None and input_quiver is not None:
         click.echo('Error: Cannot specify both --input-dir and --input-quiver', err=True)
+        sys.exit(1)
+    if batch_size < 1:
+        click.echo('Error: --batch-size must be >= 1', err=True)
         sys.exit(1)
 
     # Resolve all paths to absolute (subprocess runs in different cwd)
@@ -264,6 +270,7 @@ def proteinmpnn(
     # Design parameters
     cmd.extend(['-loop_string', loops])
     cmd.extend(['-seqs_per_struct', str(seqs_per_struct)])
+    cmd.extend(['-batch_size', str(batch_size)])
     cmd.extend(['-temperature', str(temperature)])
     cmd.extend(['-omit_AAs', omit_aas])
     if augment_eps is not None:
@@ -290,6 +297,7 @@ def proteinmpnn(
     click.echo(f'Input: {input_source}')
     click.echo(f'Loops: {loops}')
     click.echo(f'Sequences per structure: {seqs_per_struct}')
+    click.echo(f'Batch size: {batch_size}')
 
     result = subprocess.run(cmd, cwd=str(PathConfig.PROJECT_ROOT))
     sys.exit(result.returncode)

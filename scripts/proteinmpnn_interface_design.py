@@ -41,6 +41,8 @@ parser.add_argument("-loop_string", type=str, default='H1,H2,H3,L1,L2,L3',
                     help='The list of loops which you wish to design')
 parser.add_argument("-seqs_per_struct", type=int, default="1",
                     help="The number of sequences to generate for each structure (default: 1)")
+parser.add_argument("-batch_size", type=int, default=1,
+                    help="Number of sequences to sample in parallel per forward pass (default: 1)")
 
 # ProteinMPNN Specific Arguments
 default_ckpt = os.path.abspath(
@@ -103,6 +105,7 @@ class ProteinMPNN_runner():
 
         self.temperature = args.temperature
         self.seqs_per_struct = args.seqs_per_struct
+        self.batch_size = max(1, int(args.batch_size))
         self.omit_AAs = [ letter for letter in args.omit_AAs.upper() if letter in list("ARNDCQEGHILKMFPSTWYVX") ]
         self.allow_x = args.allow_x
 
@@ -126,7 +129,12 @@ class ProteinMPNN_runner():
             if os.path.exists(pdbfile):
                 os.remove(pdbfile)
 
-        arg_dict = mpnn_util.set_default_args(self.seqs_per_struct, omit_AAs=self.omit_AAs, allow_x=self.allow_x)
+        arg_dict = mpnn_util.set_default_args(
+            self.seqs_per_struct,
+            omit_AAs=self.omit_AAs,
+            allow_x=self.allow_x,
+            batch_size=self.batch_size,
+        )
         arg_dict['temperature'] = self.temperature
 
         masked_chains = sample_feats.chains[:-1]
@@ -165,13 +173,17 @@ class ProteinMPNN_runner():
 
             self.struct_manager.dump_pose(sample_feats.pose, outtag)
 
-    def run_model(self, tag, args):
+    def run_model(self, source, args):
         t0 = time.time()
+        if isinstance(source, tuple):
+            tag = source[0]
+        else:
+            tag = os.path.basename(source).split('.')[0]
 
         print(f"Attempting pose: {tag}")
         
         # Load the pose 
-        pose = self.struct_manager.load_pose(tag)
+        pose = self.struct_manager.load_pose(source)
 
         # Initialize the features
         sample_feats = SampleFeatures(pose, tag)
@@ -194,6 +206,10 @@ struct_manager = StructManager(args)
 proteinmpnn_runner = ProteinMPNN_runner(args, struct_manager)
 
 for pdb in struct_manager.iterate():
+    if isinstance(pdb, tuple):
+        checkpoint_tag = pdb[0]
+    else:
+        checkpoint_tag = os.path.basename(pdb).split('.')[0]
 
     if args.debug: proteinmpnn_runner.run_model(pdb, args)
 
@@ -206,10 +222,9 @@ for pdb in struct_manager.iterate():
 
         except:
             seconds = int(time.time() - t0)
-            print(f"Struct with tag {pdb} failed in {seconds} seconds with error: {sys.exc_info()[0]}")
+            print(f"Struct with tag {checkpoint_tag} failed in {seconds} seconds with error: {sys.exc_info()[0]}")
 
     # We are done with one pdb, record that we finished
-    struct_manager.record_checkpoint(pdb)
+    struct_manager.record_checkpoint(checkpoint_tag)
     
-
 
