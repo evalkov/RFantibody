@@ -351,6 +351,34 @@ class AbSampler(Sampler):
     def ab_design(self):
         return True
 
+    def _build_base_pose(self):
+        '''
+        Parse input structures into an AbPose.
+        '''
+        base_pose = ab_pose.AbPose()
+
+        # Determine which format the input structure has been provided
+        if self.inf_conf.input_pdb is not None:
+            assert(self.ab_conf.target_pdb is None and self.ab_conf.framework_pdb is None), \
+                    "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
+
+            base_pose.from_HLT(self.inf_conf.input_pdb)
+
+        assert(~((self.ab_conf.target_pdb is None) ^ (self.ab_conf.framework_pdb is None))), \
+                "Having antibody.target and not antibody.framework_pdb or vice versa is not currently supported."
+
+        if self.ab_conf.target_pdb is not None and self.ab_conf.framework_pdb is not None:
+            assert(self.diffuser_conf.partial_T is None), \
+                    "Partial diffusion is only supported when using inference.input_pdb"
+
+            assert(self.inf_conf.input_pdb is None), \
+                    "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
+
+            base_pose.framework_from_HLT(self.ab_conf.framework_pdb)
+            base_pose.target_from_HLT(self.ab_conf.target_pdb)
+
+        return base_pose
+
     def sample_init(self):
         '''
         We should do some autodetection of Ab chain in this function. The chain which we are designing is the Ab chain
@@ -360,31 +388,31 @@ class AbSampler(Sampler):
         #### 1) Parse pdb to an ab_pose that can be easily manipulated
         ####################################################################
         if not hasattr(self, '_base_pose_cache'):
-            base_pose = ab_pose.AbPose()
+            base_pose = self._build_base_pose()
+            try:
+                self._base_pose_cache = copy.deepcopy(base_pose)
+                self._base_pose_cache_enabled = True
+            except Exception as exc:
+                self._log.warning(
+                    "AbPose caching disabled because deepcopy failed (%s). "
+                    "Falling back to reparsing inputs per design.",
+                    exc,
+                )
+                self._base_pose_cache = None
+                self._base_pose_cache_enabled = False
 
-            # Determine which format the input structure has been provided
-            if self.inf_conf.input_pdb is not None:
-                assert(self.ab_conf.target_pdb is None and self.ab_conf.framework_pdb is None), \
-                        "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
-
-                base_pose.from_HLT(self.inf_conf.input_pdb)
-
-            assert(~((self.ab_conf.target_pdb is None) ^ (self.ab_conf.framework_pdb is None))), \
-                    "Having antibody.target and not antibody.framework_pdb or vice versa is not currently supported."
-
-            if self.ab_conf.target_pdb is not None and self.ab_conf.framework_pdb is not None:
-                assert(self.diffuser_conf.partial_T is None), \
-                        "Partial diffusion is only supported when using inference.input_pdb"
-
-                assert(self.inf_conf.input_pdb is None), \
-                        "Both inference.input_pdb and antibody.target + antibody.framework_pdb cannot be active at the same time."
-
-                base_pose.framework_from_HLT(self.ab_conf.framework_pdb)
-                base_pose.target_from_HLT(self.ab_conf.target_pdb)
-
-            self._base_pose_cache = copy.deepcopy(base_pose)
-
-        self.pose = copy.deepcopy(self._base_pose_cache)
+        if getattr(self, '_base_pose_cache_enabled', False):
+            try:
+                self.pose = copy.deepcopy(self._base_pose_cache)
+            except Exception as exc:
+                self._log.warning(
+                    "AbPose cache copy failed (%s). Falling back to reparsing inputs.",
+                    exc,
+                )
+                self._base_pose_cache_enabled = False
+                self.pose = self._build_base_pose()
+        else:
+            self.pose = self._build_base_pose()
 
 
         #### 2) Adjust the length of the CDR loops in the AbPose
