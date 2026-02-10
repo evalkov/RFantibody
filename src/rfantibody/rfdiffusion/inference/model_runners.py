@@ -523,15 +523,12 @@ class AbSampler(Sampler):
         ## 2) Now generate the time-invariant features
         ################################################
 
-        ## idx_pdb (cached — it never changes between steps) ##
-        #######################################################
+        ## idx_pdb ##
+        #############
 
-        if not hasattr(self, '_idx_pdb'):
-            idx_pdb = torch.arange(L)
-            if self.ab_item.target:
-                idx_pdb[self.ab_item.target_mask] += 200
-            self._idx_pdb = idx_pdb
-        idx_pdb = self._idx_pdb
+        idx_pdb = torch.arange(L)
+        if self.ab_item.target:
+            idx_pdb[self.ab_item.target_mask] += 200
         
         ## Add hotspots to t1d ##
         #########################
