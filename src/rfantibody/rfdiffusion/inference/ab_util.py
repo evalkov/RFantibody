@@ -477,7 +477,8 @@ def featurize(item,
               T_scheme,
               timestep,
               mask_all_sc,
-              bugfix_t1d_mask):
+              bugfix_t1d_mask,
+              device=None):
     '''
     Takes a sequence and a noised structure and returns features ready to be fed into the model
 
@@ -522,20 +523,22 @@ def featurize(item,
     '''
 
     L = seq.shape[0]
-    
+    if device is None:
+        device = seq.device
+
     ## seq ##
     #########
     seq_feat = torch.clone(seq).unsqueeze(0) # (I,L,22)
-    
+
     ## msa_masked ##
     ################
-    msa_masked = torch.zeros((1,1,L,48))
+    msa_masked = torch.zeros((1,1,L,48), device=device)
     msa_masked[:,:,:,:22] = seq[None, None]
     msa_masked[:,:,:,22:44] = seq[None, None] # (I,N,L,48)
-    
+
     ## msa_full ##
     ##############
-    msa_full = torch.zeros((1,1,L,25))
+    msa_full = torch.zeros((1,1,L,25), device=device)
     msa_full[:,:,:,:22] = seq[None, None] # (I,N,L,25)
 
     ## xyz_t ##
@@ -553,7 +556,7 @@ def featurize(item,
 
     ## t1d ##
     #########
-    t1d = torch.zeros((1,L,d_t1d)) # (1,L,d_t1d)
+    t1d = torch.zeros((1,L,d_t1d), device=device) # (1,L,d_t1d)
     # We will mask the sequence in t1d in the apply_templating_scheme call
     t1d[:,:,:20] = seq[None,:,:20]
     if bugfix_t1d_mask:

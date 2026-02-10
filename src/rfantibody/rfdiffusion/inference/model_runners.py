@@ -499,7 +499,11 @@ class AbSampler(Sampler):
         ## 1) Generate the time-dependent features
         ################################################
 
-        tmp_xyz = torch.full((L,27,3), np.nan)
+        # Move inputs to device before featurization so tensors are built on GPU
+        seq = seq.to(self.device)
+        xyz_t = xyz_t.to(self.device)
+
+        tmp_xyz = torch.full((L,27,3), float('nan'), device=self.device)
         tmp_xyz[:,:14] = xyz_t # [L,27,3]
 
         # Featurize expects xyz to have 27 atom dimensions
@@ -512,18 +516,22 @@ class AbSampler(Sampler):
                              self.ab_conf.T_scheme,
                              1 - (t / self.T),
                              ~self.preprocess_conf.motif_sidechain_input,
-                             ~self.ab_conf.no_bugfix_t1d_mask
+                             ~self.ab_conf.no_bugfix_t1d_mask,
+                             device=self.device
                             )
 
         ## 2) Now generate the time-invariant features
         ################################################
-        
-        ## idx_pdb ##
-        #############
 
-        idx_pdb = torch.arange(L) # (L)
-        if self.ab_item.target:
-            idx_pdb[self.ab_item.target_mask] += 200 # Do idx jump at chainbreak
+        ## idx_pdb (cached — it never changes between steps) ##
+        #######################################################
+
+        if not hasattr(self, '_idx_pdb'):
+            idx_pdb = torch.arange(L)
+            if self.ab_item.target:
+                idx_pdb[self.ab_item.target_mask] += 200
+            self._idx_pdb = idx_pdb
+        idx_pdb = self._idx_pdb
         
         ## Add hotspots to t1d ##
         #########################

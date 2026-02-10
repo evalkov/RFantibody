@@ -127,55 +127,40 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
 
     R_t, Ca_t = rigid_from_3_points(N_t, Ca_t, C_t)
 
-    # this must be to normalize them or something
-    R_0 = scipy_R.from_matrix(R_0.squeeze().numpy()).as_matrix()
-    R_t = scipy_R.from_matrix(R_t.squeeze().numpy()).as_matrix()
+    # Re-orthogonalize via SVD (replaces scipy_R round-trip)
+    R_0_sq = R_0.squeeze()
+    U0, _, Vh0 = torch.linalg.svd(R_0_sq)
+    R_0 = U0 @ Vh0
 
+    R_t_sq = R_t.squeeze()
+    Ut, _, Vht = torch.linalg.svd(R_t_sq)
+    R_t = Ut @ Vht
 
     L = R_t.shape[0]
-    all_rot_transitions = np.broadcast_to(np.identity(3), (L, 3, 3)).copy()
+    device = R_t.device
+    all_rot_transitions = torch.eye(3, device=device).unsqueeze(0).expand(L, 3, 3).clone()
+
     # Sample next frame for each residue
     if so3_type == "igso3":
         # don't do calculations on masked positions since they end up as identity matrix
-        all_rot_transitions[~diffusion_mask] = diffuser.so3_diffuser.reverse_sample_vectorized(R_t[~diffusion_mask], R_0[~diffusion_mask], t, 
-                                                                                        noise_level=noise_scale, mask=None, return_perturb=True, rotation_scaling=rotation_scaling)
+        all_rot_transitions[~diffusion_mask] = diffuser.so3_diffuser.reverse_sample_vectorized(
+            R_t[~diffusion_mask], R_0[~diffusion_mask], t,
+            noise_level=noise_scale, mask=None, return_perturb=True, rotation_scaling=rotation_scaling)
     elif so3_type == "slerp":
-        vect_all_rot_transitions[~diffusion_mask] = slerp_update_vectorized(R_t[~diffusion_mask], R_0[~diffusion_mask], t, 
-                                                                                                    mask=diffusion_mask[~diffusion_mask])    
+        vect_all_rot_transitions[~diffusion_mask] = slerp_update_vectorized(
+            R_t[~diffusion_mask], R_0[~diffusion_mask], t,
+            mask=diffusion_mask[~diffusion_mask])
     else:
-        assert False, "so3 diffusion type %s not implemented"%so3_type
+        assert False, "so3 diffusion type %s not implemented" % so3_type
 
-    all_rot_transitions = all_rot_transitions[:,None,:,:]
+    all_rot_transitions = all_rot_transitions[:, None, :, :]
 
+    # Apply the interpolated rotation matrices to the coordinates (pure torch)
+    Ca_t_sq = Ca_t.squeeze()
+    next_crds = torch.einsum('lrij,laj->lrai', all_rot_transitions,
+                             xt[:, :3, :] - Ca_t_sq[:, None, :]) + Ca_t_sq[:, None, None, :]
 
-    assert_vectorized_is_equal = False
-    if assert_vectorized_is_equal:
-        # Sample next frame for each residue
-        check_all_rot_transitions = []
-        for i in range(len(xt)):
-            r_0 = R_0[i] #.as_matrix()
-            r_t = R_t[i] #.as_matrix()
-            mask_i = diffusion_mask[i]
-
-            if so3_type == "igso3":
-                r_t_next = diffuser.so3_diffuser.reverse_sample(r_t, r_0, t,
-                        mask=mask_i, noise_level=noise_scale)[None,...]
-                interp_rot =  r_t_next @ (r_t.T)
-            elif so3_type == "slerp":
-                interp_rot = slerp_update(r_t, r_0, t, diffusion_mask[i])
-            else:
-                assert False, "so3 diffusion type %s not implemented"%so3_type
-
-            check_all_rot_transitions.append(interp_rot)
-
-        check_all_rot_transitions = np.stack(check_all_rot_transitions, axis=0)
-
-        assert np.allclose(check_all_rot_transitions, all_rot_transitions)
-
-    # Apply the interpolated rotation matrices to the coordinates
-    next_crds   = np.einsum('lrij,laj->lrai', all_rot_transitions, xt[:,:3,:] - Ca_t.squeeze()[:,None,...].numpy()) + Ca_t.squeeze()[:,None,None,...].numpy()
-
-    # (L,3,3) set of backbone coordinates with slight rotation 
+    # (L,3,3) set of backbone coordinates with slight rotation
     return next_crds.squeeze(1)
 
 def get_mu_xt_x0(xt, px0, t, beta_schedule, alphabar_schedule, eps=1e-6):
@@ -459,6 +444,9 @@ class Denoise():
         #self.aa_decode_times, self.decode_order, self.idx2steps, self.aa_mask_stack = out
         if seq_diffuser is None: self.decode_scheduler = DecodeSchedule(L, visible, aa_decode_steps, mode='distance_based')
 
+        # Cache ComputeAllAtomCoords so we don't recreate it every step
+        self._allatom = ComputeAllAtomCoords()
+
     @property
     def idx2steps(self):
         return self.decode_scheduler.idx2steps.numpy()
@@ -686,76 +674,66 @@ class Denoise():
         First, get rotation matrix from px0 to xT for the motif residues.
         Second, rotate px0 (whole structure) by that rotation matrix
         Third, centre at origin
+
+        Pure-torch implementation — stays on the original device.
         """
 
-        #if True:
-        #    return px0
-        def rmsd(V,W, eps=0):
-            # First sum down atoms, then sum down xyz
+        def rmsd(V, W, eps=0):
             N = V.shape[-2]
-            return np.sqrt(np.sum((V-W)*(V-W), axis=(-2,-1)) / N + eps)
+            return torch.sqrt(torch.sum((V - W) * (V - W), dim=(-2, -1)) / N + eps)
 
         assert xT.shape[1] == px0.shape[1], f'xT has shape {xT.shape} and px0 has shape {px0.shape}'
 
-        L,n_atom,_ = xT.shape # A is number of atoms
+        device = px0.device
+        L, n_atom, _ = xT.shape
         atom_mask = ~torch.isnan(px0)
-        #convert to numpy arrays
-        px0 = px0.cpu().detach().numpy()
-        xT = xT.cpu().detach().numpy()
-        diffusion_mask = diffusion_mask.cpu().detach().numpy()
+
+        # Work with clones so we don't mutate the caller's tensors
+        px0 = px0.clone()
+        xT = xT.clone()
 
         #1 centre motifs at origin and get rotation matrix
-        px0_motif = px0[diffusion_mask,:3].reshape(-1,3)
-        xT_motif  =  xT[diffusion_mask,:3].reshape(-1,3)
-        px0_motif_mean = np.copy(px0_motif.mean(0)) #need later
-        xT_motif_mean  = np.copy(xT_motif.mean(0))
+        px0_motif = px0[diffusion_mask, :3].reshape(-1, 3)
+        xT_motif = xT[diffusion_mask, :3].reshape(-1, 3)
+        px0_motif_mean = px0_motif.mean(0).clone()
+        xT_motif_mean = xT_motif.mean(0).clone()
 
         # center at origin
-        px0_motif  = px0_motif-px0_motif_mean
-        xT_motif   = xT_motif-xT_motif_mean
+        px0_motif = px0_motif - px0_motif_mean
+        xT_motif = xT_motif - xT_motif_mean
 
-        # A = px0_motif
-        # B = xT_motif 
         A = xT_motif
         B = px0_motif
 
-        C = np.matmul(A.T, B)
+        C = A.T @ B
 
         # compute optimal rotation matrix using SVD
-        U,S,Vt = np.linalg.svd(C)
-
+        U, S, Vh = torch.linalg.svd(C)
 
         # ensure right handed coordinate system
-        d = np.eye(3)
-        d[-1,-1] = np.sign(np.linalg.det(Vt.T@U.T))
+        d = torch.eye(3, device=device, dtype=px0.dtype)
+        d[-1, -1] = torch.sign(torch.linalg.det(Vh.T @ U.T))
 
         # construct rotation matrix
-        R = Vt.T@d@U.T
+        R = Vh.T @ d @ U.T
 
         # get rotated coords
-        rB = B@R
+        rB = B @ R
 
         # calculate rmsd
-        rms = rmsd(A,rB)
+        rms = rmsd(A, rB)
         self._log.info(f'Sampled motif RMSD: {rms:.2f}')
 
         #2 rotate whole px0 by rotation matrix
-        atom_mask = atom_mask.cpu()
-        px0[~atom_mask] = 0 #convert nans to 0
-        px0 = px0.reshape(-1,3) - px0_motif_mean
+        px0[~atom_mask] = 0  # convert nans to 0
+        px0 = px0.reshape(-1, 3) - px0_motif_mean
         px0_ = px0 @ R
-        # xT_motif_out = xT_motif.reshape(-1,3)
-        # xT_motif_out = (xT_motif_out @ R ) + px0_motif_mean
-        # ic(xT_motif_out.shape)
-        # xT_motif_out = xT_motif_out.reshape((diffusion_mask.sum(),3,3))
-
 
         #3 put in same global position as xT
         px0_ = px0_ + xT_motif_mean
-        px0_ = px0_.reshape([L,n_atom,3])
+        px0_ = px0_.reshape(L, n_atom, 3)
         px0_[~atom_mask] = float('nan')
-        return torch.Tensor(px0_)
-        # return torch.tensor(xT_motif_out)
+        return px0_
 
 
     def get_potential_gradients(self, seq, xyz, diffusion_mask ):
@@ -843,7 +821,7 @@ class Denoise():
             include_motif_sidechains (bool): Provide sidechains of the fixed motif to the model
         """
 
-        get_allatom = ComputeAllAtomCoords().to(device=xt.device)
+        get_allatom = self._allatom.to(device=xt.device)
         L,n_atom = xt.shape[:2]
         assert (xt.shape[1]  == 14) or (xt.shape[1]  == 27)
         assert (px0.shape[1] == 14) or (px0.shape[1] == 27)# need full atom rep for torsion calculations   
@@ -881,7 +859,7 @@ class Denoise():
         ca_deltas += self.potential_manager.get_guide_scale(t) * grad_ca
         
         # add the delta to the new frames 
-        frames_next = torch.from_numpy(frames_next) + ca_deltas[:,None,:]  # translate
+        frames_next = frames_next + ca_deltas[:, None, :]  # translate
 
         if diffuse_sidechains:
             if self.seq_diffuser:
