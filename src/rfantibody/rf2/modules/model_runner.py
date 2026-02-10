@@ -63,6 +63,8 @@ class AbPredictor(Predictor):
         best_lddt = torch.tensor([-1.0], device=self.device)
 
         to_write=OrderedDict()
+        converge_threshold = getattr(self.conf.inference, 'converge_threshold', 0.5)
+        prev_ca = None
         print(f"[RF2] Processing: {tag}")
         with torch.no_grad():
             for i_cycle in range(self.conf.inference.num_recycles + 1):
@@ -77,16 +79,29 @@ class AbPredictor(Predictor):
                 output_pose_i = pu.pose_from_RF_output(output_i, pose)
                 metrics_i=self._process_output(output_i, output_pose_i, pose)
 
-                print(f"[RF2]   Cycle {i_cycle + 1}/{self.conf.inference.num_recycles + 1} - pLDDT: {metrics_i['pred_lddt'].mean():.3f}")
+                # Check structural convergence (Cα RMSD between consecutive cycles)
+                curr_ca = output_pose_i.xyz[:, 1]
+                if prev_ca is not None:
+                    ca_rmsd = torch.sqrt(((curr_ca - prev_ca) ** 2).sum(-1).mean()).item()
+                else:
+                    ca_rmsd = float('inf')
+
+                print(f"[RF2]   Cycle {i_cycle + 1}/{self.conf.inference.num_recycles + 1}"
+                      f" - pLDDT: {metrics_i['pred_lddt'].mean():.3f}"
+                      f" - Ca RMSD: {ca_rmsd:.4f}")
 
                 if metrics_i['pred_lddt'].mean() > best_lddt.mean():
                     best_lddt = metrics_i['pred_lddt']
-                    best_pose = copy.deepcopy(output_pose_i)
-                    best_metrics = copy.deepcopy(metrics_i)
+                    best_pose = output_pose_i
+                    best_metrics = {k: v.clone() if torch.is_tensor(v) else v for k, v in metrics_i.items()}
                     to_write['best'] = {'pose': best_pose, 'metrics': best_metrics}
                 if self.conf.output.output_intermediates:
                     to_write[i_cycle] = {'pose': output_pose_i, 'metrics': metrics_i}
-                torch.cuda.empty_cache()
+
+                if prev_ca is not None and ca_rmsd < converge_threshold:
+                    print(f"[RF2]   Converged at cycle {i_cycle + 1} (Ca RMSD {ca_rmsd:.4f} < {converge_threshold})")
+                    break
+                prev_ca = curr_ca.clone()
         print(f"[RF2] Completed: {tag} - Best pLDDT: {best_lddt.mean():.3f}")
         write_output(to_write, tag, self.conf)
 
