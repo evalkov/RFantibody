@@ -686,8 +686,10 @@ class Denoise():
 
         device = px0.device
         L, n_atom, _ = xT.shape
-        atom_mask = ~torch.isnan(px0)
+        # Ensure all inputs are on the same device
+        xT = xT.to(device)
         diffusion_mask = diffusion_mask.to(device)
+        atom_mask = ~torch.isnan(px0)
 
         # Work with clones so we don't mutate the caller's tensors
         px0 = px0.clone()
