@@ -162,11 +162,10 @@ class Pose:
         """
         Returns a mask for the same chain.
         Note both antibody chains go on same chain
-        Returns a boolean tensor for proper masking operations.
         """
-        same_chain = torch.zeros((self.length, self.length), dtype=torch.bool)
-        same_chain[:self.target_length, :self.target_length] = True
-        same_chain[self.target_length:, self.target_length:] = True
+        same_chain = torch.zeros((self.length, self.length)).long()
+        same_chain[:self.target_length, :self.target_length] = 1
+        same_chain[self.target_length:, self.target_length:] = 1
         return same_chain
 
 @dataclass
