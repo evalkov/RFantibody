@@ -1,5 +1,6 @@
 # script for diffusion protocols
 import logging
+import math
 import os
 import pickle
 import time
@@ -366,9 +367,18 @@ class IGSO3():
     def discrete_sigma(self):
         return self.igso3_vals['discrete_sigma']
 
-    def sigma_idx(self, sigma: np.ndarray):
-        """Calculates the index for discretized sigma during IGSO(3) initialization."""
-        return np.digitize(sigma, self.discrete_sigma) - 1
+    def sigma_idx(self, sigma):
+        """Calculates the index for discretized sigma during IGSO(3) initialization.
+
+        Accepts numpy arrays (used at init time) or torch tensors (used in hot loop).
+        """
+        if isinstance(sigma, np.ndarray):
+            return np.digitize(sigma, self.discrete_sigma) - 1
+        # torch path – used in the per-step hot loop
+        if not isinstance(sigma, torch.Tensor):
+            sigma = torch.tensor(sigma)
+        return torch.searchsorted(self._discrete_sigma, sigma.float().reshape(-1)).clamp(
+            max=len(self._discrete_sigma) - 1).item()
 
     def t_to_idx(self, t):
         """Helper function to go from discrete time index t to corresponding sigma_idx.
@@ -449,21 +459,23 @@ class IGSO3():
         return x * self.sample(ts, n_samples=n_samples)[..., None]
 
     def score_norm(self, t, omega):
-        """score_norm computes the score norm based on the time step and angle
+        """score_norm computes the score norm based on the time step and angle.
+
+        Pure-torch vectorized linear interpolation (replaces np.interp).
 
         Args:
             t: integer time step
-            omega: angles (scalar or shape [N])
+            omega: angles as torch tensor of shape [N]
         Return:
-            score_norm with same shape as omega
+            score_norm as torch tensor with same shape as omega
         """
         sigma_idx = self.t_to_idx(t)
-        score_norm_t = np.interp(
-                omega,
-                self.igso3_vals['discrete_omega'],
-                self.igso3_vals['score_norm'][sigma_idx]
-                )
-        return score_norm_t
+        x = self._discrete_omega.to(omega.device)
+        y = self._score_norm_table[sigma_idx].to(omega.device)
+        omega_clamped = omega.clamp(x[0], x[-1])
+        idx = torch.searchsorted(x, omega_clamped).clamp(1, len(x) - 1)
+        slope = (omega_clamped - x[idx - 1]) / (x[idx] - x[idx - 1])
+        return y[idx - 1] + slope * (y[idx] - y[idx - 1])
 
     def score_vec(self, ts, vec):
         """score_vec computes the score of the IGSO(3) density as a rotation
@@ -642,29 +654,33 @@ class IGSO3():
 
 
     def reverse_sample_vectorized(self, R_t, R_0, t, noise_level, mask=None, return_perturb=False, rotation_scaling=None):
-        """ Vectorized version of reverse_sample() """
+        """Vectorized version of reverse_sample() — pure torch, no scipy/numpy."""
 
-        R_0, R_t = torch.tensor(R_0), torch.tensor(R_t)
+        if not isinstance(R_0, torch.Tensor):
+            R_0 = torch.tensor(R_0)
+        if not isinstance(R_t, torch.Tensor):
+            R_t = torch.tensor(R_t)
+
         R_0t = torch.einsum('...ij,...kj->...ik', R_t, R_0)
-        R_0t_rotvec = torch.tensor(scipy_R.from_matrix(
-                    R_0t.cpu().numpy()).as_rotvec()).to(R_0.device)
+        R_0t_rotvec = rotation_conversions.matrix_to_axis_angle(R_0t)
 
-        Omega = torch.linalg.norm(R_0t_rotvec, axis=-1).numpy()
-        Score_approx = R_0t_rotvec*(self.score_norm(t, Omega)/Omega)[:,None]
+        Omega = torch.linalg.norm(R_0t_rotvec, dim=-1)
+        score_norm_vals = self.score_norm(t, Omega)
+        Score_approx = R_0t_rotvec * (score_norm_vals / Omega)[:, None]
 
-        continuous_t = t/self.T
+        continuous_t = t / self.T
         rot_g = self.g(continuous_t).to(Score_approx.device)
 
-        Z = np.random.normal(size=(R_0.shape[0], 3))
-        Z = torch.from_numpy(Z).to(Score_approx.device)
+        Z = torch.randn(R_0.shape[0], 3, device=Score_approx.device, dtype=Score_approx.dtype)
         Z *= noise_level
 
         if rotation_scaling is None:
-            Perturb_rotvec = (rot_g ** 2) * self.step_size * Score_approx + rot_g * np.sqrt(self.step_size) * Z
+            Perturb_rotvec = (rot_g ** 2) * self.step_size * Score_approx + rot_g * math.sqrt(self.step_size) * Z
         else:
             Perturb_rotvec = (rot_g ** 2) * self.step_size * Score_approx * 0.5 * rotation_scaling
 
-        if mask is not None: Perturb_rotvec *= (1-mask.long())[:,None]
+        if mask is not None:
+            Perturb_rotvec *= (1 - mask.long())[:, None]
 
         Perturb = rotation_conversions.axis_angle_to_matrix(Perturb_rotvec)
         if return_perturb:
