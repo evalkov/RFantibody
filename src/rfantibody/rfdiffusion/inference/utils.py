@@ -128,13 +128,18 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
     R_t, Ca_t = rigid_from_3_points(N_t, Ca_t, C_t)
 
     # Re-orthogonalize via SVD (replaces scipy_R round-trip)
+    # Determinant correction ensures proper rotations (det=+1), not reflections
     R_0_sq = R_0.squeeze()
-    U0, _, Vh0 = torch.linalg.svd(R_0_sq)
-    R_0 = U0 @ Vh0
+    U0, S0, Vh0 = torch.linalg.svd(R_0_sq)
+    d0 = torch.ones_like(S0)
+    d0[..., -1] = torch.sign(torch.linalg.det(U0 @ Vh0))
+    R_0 = U0 @ (d0[..., None] * Vh0)
 
     R_t_sq = R_t.squeeze()
-    Ut, _, Vht = torch.linalg.svd(R_t_sq)
-    R_t = Ut @ Vht
+    Ut, St, Vht = torch.linalg.svd(R_t_sq)
+    dt = torch.ones_like(St)
+    dt[..., -1] = torch.sign(torch.linalg.det(Ut @ Vht))
+    R_t = Ut @ (dt[..., None] * Vht)
 
     L = R_t.shape[0]
     device = R_t.device
