@@ -89,8 +89,7 @@ class Preprocess:
         T,L = inputs.xyz_t.shape[:2]
 
         # xyzs
-        seed = getattr(self.conf.inference, 'seed', None) if hasattr(self.conf, 'inference') else None
-        xyz_t, xyz_true, xyz_prev=get_xyzs(inputs, seed=seed)
+        xyz_t, xyz_true, xyz_prev=get_xyzs(inputs)
         
         # seq/MSA
         seq = inputs.seq
@@ -132,17 +131,10 @@ def check_inputs(inputs: Dotdict) -> None:
         raise ValueError(f'token in sequence is > 21, max is {torch.max(inputs.seq)}')
 
 @check_for_nans
-def get_xyzs(inputs: Dotdict, seed: int = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_xyzs(inputs: Dotdict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Gets xyzs from inputs
-
-    Args:
-        inputs: Input dictionary containing xyz_t, mask_t, xyz_true
-        seed: Random seed for xyz initialization (optional, for deterministic mode)
     """
-    # Set seed right before xyz initialization to ensure reproducibility
-    if seed is not None:
-        torch.manual_seed(seed)
     xyz_t=util.get_init_xyz(inputs.xyz_t, inputs.mask_t)
     xyz_true = torch.nan_to_num(inputs.xyz_true)
     xyz_prev = xyz_t[0].clone()
