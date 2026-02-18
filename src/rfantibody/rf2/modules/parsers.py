@@ -37,9 +37,6 @@ def parse_HLT_lines(lines: list[str]) -> Dotdict:
 
     fix_any_duplicates(out)
 
-    # Reorder chains to T-H-L (Target first, to match rf_antibody)
-    reorder_chains_to_THL(out)
-
     return out
 
 def parse_pdblines(lines: list[str]) -> tuple[torch.Tensor, list, torch.Tensor]:
@@ -109,30 +106,4 @@ def fix_any_duplicates(pdb: Dotdict) -> None:
     pdb['idx'] = pdb['idx'][mask]
     pdb['cdr_masks'] = {k:v[mask] for k,v in pdb['cdr_masks'].items()}
 
-def reorder_chains_to_THL(pdb: Dotdict) -> None:
-    """
-    Reorders chains from PDB file order (typically H-L-T) to T-H-L (Target first).
-    This matches rf_antibody's chain ordering convention.
-    Modifies the pdb dict in place.
-    """
-    # Find indices for each chain
-    T_indices = [i for i, (chain, _) in enumerate(pdb['pdb_idx']) if chain == 'T']
-    H_indices = [i for i, (chain, _) in enumerate(pdb['pdb_idx']) if chain == 'H']
-    L_indices = [i for i, (chain, _) in enumerate(pdb['pdb_idx']) if chain == 'L']
-
-    # If no target chain present, no reordering needed (pure antibody)
-    if len(T_indices) == 0:
-        return
-
-    # Create new ordering: T, H, L
-    new_order = T_indices + H_indices + L_indices
-    new_order_tensor = torch.tensor(new_order, dtype=torch.long)
-
-    # Reorder all fields
-    pdb['pdb_idx'] = [pdb['pdb_idx'][i] for i in new_order]
-    pdb['seq'] = pdb['seq'][new_order_tensor]
-    pdb['xyz'] = pdb['xyz'][new_order_tensor]
-    pdb['atom_mask'] = pdb['atom_mask'][new_order_tensor]
-    pdb['idx'] = pdb['idx'][new_order_tensor]
-    pdb['cdr_masks'] = {k: v[new_order_tensor] for k, v in pdb['cdr_masks'].items()}
 
