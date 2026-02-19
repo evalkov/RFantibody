@@ -10,10 +10,10 @@ import numpy as np
 import torch
 from icecream import ic
 from scipy.spatial.transform import Rotation as scipy_R
-from scipy.spatial.transform import Slerp
 
 import rfantibody.rfdiffusion.igso3 as igso3
 import rfantibody.rfdiffusion.rotation_conversions as rotation_conversions
+from rfantibody.rfdiffusion.rotation_conversions import quaternion_slerp
 from rfantibody.rfdiffusion.chemical import INIT_CRDS
 from rfantibody.rfdiffusion.diff_util import (
     get_aa_schedule,
@@ -714,77 +714,81 @@ class SLERP():
     
     def slerp(self, xyz, diffusion_mask=None):
         """
-        Perform spherical linear interpolation from the True coordinate frame for each 
-        residue to a randomly sampled coordinate frame 
+        Perform spherical linear interpolation from the True coordinate frame for each
+        residue to a randomly sampled coordinate frame.
+
+        Vectorized using batched quaternion SLERP — no per-residue Python loop.
 
         Parameters:
-            xyz (np.array or torch.tensor, required): (L,3,3) set of backbone coordinates 
+            xyz (np.array or torch.tensor, required): (L,3,3) set of backbone coordinates
 
-            mask (np.array or torch.tensor, required): (L,1) set of bools. True/1 is NOT diffused, False/0 IS diffused
+            diffusion_mask (np.array or torch.tensor, required): (L,) set of bools.
+                True/1 is NOT diffused, False/0 IS diffused
         Returns:
-            np.array : N/CA/C coordinates for each residue in the SLERP 
-                        (T,L,3,3), where T is num timesteps
-            
+            np.array : N/CA/C coordinates for each residue in the SLERP
+                        (L,T,3,3), where T is num timesteps
         """
-        # diffusion_mask = None 
-
         if torch.is_tensor(xyz):
             xyz = xyz.numpy()
 
+        L = len(xyz)
         t = np.arange(self.T)
-        alpha = t/self.T
-        
-        R_rand = scipy_R.random(len(xyz))
-        
-        N  = torch.from_numpy(  xyz[None,:,0,:]  )
-        Ca = torch.from_numpy(  xyz[None,:,1,:]  )
-        C  = torch.from_numpy(  xyz[None,:,2,:]  )
-        
-        # scipy rotation object for true coordinates
-        R_true, Ca = rigid_from_3_points(N,Ca,C)
-        R_true = scipy_R.from_matrix(R_true.squeeze())
-        
-        # bad - could certainly vectorize somehow 
-        all_interps = []
-        for i in range(len(xyz)):
+        alpha_vals = torch.from_numpy(t / self.T).float()  # (T,)
 
-            r_true = R_true[i].as_matrix()
-            r_rand = R_rand[i].as_matrix()
+        # Random target rotations
+        R_rand = rotation_conversions.random_rotations(L)  # (L, 3, 3)
 
-            # handle potential nans in BB frames / crds 
-            if not np.isnan(r_true).any():
-            
-                if not diffusion_mask[i]:
-                    key_rots = scipy_R.from_matrix(np.stack([r_true, r_rand], axis=0))
-                else:
-                    key_rots = scipy_R.from_matrix(np.stack([r_true, r_true], axis=0))
+        N  = torch.from_numpy(xyz[None, :, 0, :])
+        Ca = torch.from_numpy(xyz[None, :, 1, :])
+        C  = torch.from_numpy(xyz[None, :, 2, :])
 
-            else:
-                key_rots = scipy_R.from_matrix(np.stack([np.eye(3), np.eye(3)], axis=0))
-        
-            key_times = [0,1]
-        
-            interpolator = Slerp(key_times, key_rots)
-            interp_time = alpha
-            
-            # grab the interpolated FRAMES 
-            interp_frame  = interpolator(interp_time)
-            
-            # construct the rotation matrix which when applied YIELDS interpolated frames 
-            interp_rot = (interp_frame.as_matrix().squeeze() @ np.linalg.inv(r_true.squeeze()) )[None,...]
+        # True rotation matrices from backbone coordinates
+        R_true_mat, Ca = rigid_from_3_points(N, Ca, C)
+        R_true_mat = R_true_mat.squeeze(0)  # (L, 3, 3)
+        Ca = Ca.squeeze(0)  # (L, 3)
 
-            all_interps.append(interp_rot)
-        
-        all_interps = np.concatenate(all_interps, axis=0)
-        
-        # Now apply all the interpolated rotation matrices to the original rotation matrices and get the frames at each timestep
-        slerped_frames = np.einsum('lrij,ljk->lrik', all_interps, R_true.as_matrix())
-        
-        # apply the slerped frames to the coordinates
-        slerped_crds   = np.einsum('lrij,laj->lrai', all_interps, xyz[:,:3,:] - Ca.squeeze()[:,None,...].numpy()) + Ca.squeeze()[:,None,None,...].numpy()
+        # Handle NaN BB frames: replace with identity
+        nan_mask = torch.isnan(R_true_mat).any(dim=-1).any(dim=-1)  # (L,)
+        eye = torch.eye(3).unsqueeze(0).expand(L, 3, 3)
+        R_true_mat = torch.where(nan_mask[:, None, None], eye, R_true_mat)
 
-        # (T,L,3,3) set of backbone coordinates and frames 
-        return slerped_crds, slerped_frames
+        # For masked (non-diffused) residues: interpolate R_true -> R_true (no-op)
+        # For NaN residues: also identity -> identity
+        if diffusion_mask is not None:
+            if not isinstance(diffusion_mask, torch.Tensor):
+                diffusion_mask = torch.tensor(diffusion_mask, dtype=torch.bool)
+            # Masked or NaN: target = R_true (so SLERP is a no-op)
+            no_diffuse = diffusion_mask | nan_mask
+            R_end = torch.where(no_diffuse[:, None, None], R_true_mat, R_rand)
+        else:
+            R_end = torch.where(nan_mask[:, None, None], R_true_mat, R_rand)
+
+        # Convert to quaternions: (L, 4)
+        q_true = rotation_conversions.matrix_to_quaternion(R_true_mat)
+        q_end = rotation_conversions.matrix_to_quaternion(R_end)
+
+        # Batched SLERP for all T timesteps: expand to (L, T, 4)
+        q_true_exp = q_true.unsqueeze(1).expand(L, self.T, 4)
+        q_end_exp = q_end.unsqueeze(1).expand(L, self.T, 4)
+        alpha_exp = alpha_vals.unsqueeze(0).expand(L, self.T)  # (L, T)
+
+        q_interp = quaternion_slerp(q_true_exp, q_end_exp, alpha_exp)  # (L, T, 4)
+        Interp_frame = rotation_conversions.quaternion_to_matrix(q_interp)  # (L, T, 3, 3)
+
+        # Compute relative rotation: Interp_frame @ R_true^T -> all_interps (L, T, 3, 3)
+        R_true_inv = R_true_mat.transpose(-1, -2)  # (L, 3, 3)
+        all_interps = torch.einsum('ltij,ljk->ltik', Interp_frame, R_true_inv)
+
+        # Slerped frames: all_interps @ R_true -> (L, T, 3, 3)
+        slerped_frames = torch.einsum('ltij,ljk->ltik', all_interps, R_true_mat)
+
+        # Slerped coordinates
+        xyz_torch = torch.from_numpy(xyz).float()
+        Ca_expanded = Ca[:, None, None, :]  # (L, 1, 1, 3)
+        centered = xyz_torch[:, :3, :] - Ca[:, None, :]  # (L, 3, 3)
+        slerped_crds = torch.einsum('ltij,laj->ltai', all_interps, centered) + Ca_expanded
+
+        return slerped_crds.numpy(), slerped_frames.numpy()
 
 
 class INTERP():

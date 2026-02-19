@@ -592,3 +592,54 @@ def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
     """
     batch_dim = matrix.size()[:-2]
     return matrix[..., :2, :].clone().reshape(batch_dim + (6,))
+
+
+def quaternion_slerp(
+    q0: torch.Tensor, q1: torch.Tensor, alpha
+) -> torch.Tensor:
+    """Batched quaternion SLERP (Spherical Linear intERPolation).
+
+    Interpolates between quaternions q0 and q1 at parameter alpha.
+    Handles antipodal quaternions (shortest path) and near-identity
+    edge cases.
+
+    Args:
+        q0: quaternions of shape (..., 4), real part first.
+        q1: quaternions of shape (..., 4), real part first.
+        alpha: interpolation parameter(s), broadcastable to q0/q1 batch dims.
+            Scalar, float, or tensor. 0 -> q0, 1 -> q1.
+
+    Returns:
+        Interpolated quaternions of shape (..., 4), real part first.
+    """
+    if not isinstance(alpha, torch.Tensor):
+        alpha = torch.tensor(alpha, dtype=q0.dtype, device=q0.device)
+    # Ensure alpha has a trailing dim for broadcasting with quaternion components
+    while alpha.dim() < q0.dim():
+        alpha = alpha.unsqueeze(-1)
+
+    # Dot product to find angle between quaternions
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+
+    # Ensure shortest path: flip q1 if dot < 0
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = dot.abs()
+
+    # Clamp for numerical stability
+    dot = dot.clamp(max=1.0 - 1e-6)
+
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+
+    # For very small angles, use linear interpolation as fallback
+    small = (sin_theta.abs() < 1e-6).expand_as(q0)
+    s0 = torch.sin((1.0 - alpha) * theta) / sin_theta
+    s1 = torch.sin(alpha * theta) / sin_theta
+
+    result = s0 * q0 + s1 * q1
+    # Fallback: linear interpolation + normalize for near-zero angles
+    linear = (1.0 - alpha) * q0 + alpha * q1
+    result = torch.where(small, linear, result)
+
+    # Normalize to unit quaternion
+    return result / result.norm(dim=-1, keepdim=True)

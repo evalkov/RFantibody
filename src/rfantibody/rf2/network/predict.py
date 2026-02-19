@@ -520,8 +520,8 @@ class Predictor():
                     _, xyz_prev = self.xyz_converter.compute_all_atom(seq, xyz_prev, alpha)
 
                 mask_recycle=None
-                pair_prev = pair_prev.cpu()
-                msa_prev = msa_prev.cpu()
+                # Keep pair_prev and msa_prev on GPU to avoid unnecessary CPU↔GPU transfers.
+                # The model's forward handles .to(device) which is a no-op when already on GPU.
 
                 pred_lddt = nn.Softmax(dim=1)(pred_lddt.half()) * self.lddt_bins[None,:,None]
                 pred_lddt = pred_lddt.sum(dim=1)
@@ -532,7 +532,6 @@ class Predictor():
 
                 print (f"recycle {i_cycle} plddt {pred_lddt.mean():.3f} pae {logits_pae.mean():.3f} rmsd {rmsd[0]:.3f}")
 
-                torch.cuda.empty_cache()
                 if pred_lddt.mean() < best_lddt.mean():
                     pred_lddt, logits_pae, logit_s = None, None, None
                     continue

@@ -12,10 +12,10 @@ import torch
 import torch.nn.functional as nn
 from icecream import ic
 from omegaconf import DictConfig
-from scipy.spatial.transform import Rotation as scipy_R
-from scipy.spatial.transform import Slerp
 
+import rfantibody.rfdiffusion.rotation_conversions as rotation_conversions
 import rfantibody.rfdiffusion.util as util
+from rfantibody.rfdiffusion.rotation_conversions import quaternion_slerp
 from rfantibody.rfdiffusion.diff_util import (
     get_aa_schedule,
     th_interpolate_angle_single,
@@ -42,54 +42,37 @@ from rfantibody.rfdiffusion.util_module import ComputeAllAtomCoords
 
 # These functions behave exactly the same as before but now do not rely on class fields from the Denoiser
 
-def slerp_update(r_t, r_0, t, mask=0):
-    """slerp_update uses SLERP to update the frames at time t to the
-    predicted frame for t=0
+def slerp_update_vectorized(R_t, R_0, t, mask=0):
+    """Vectorized SLERP update using batched quaternion interpolation.
 
     Args:
-        R_t, R_0: rotation matrices of shape [3, 3]
+        R_t: rotation matrices of shape [L, 3, 3] (numpy or torch)
+        R_0: rotation matrices of shape [L, 3, 3] (numpy or torch)
         t: time step
-        mask: set to 1 / True to skip update.
+        mask: bool array of shape [L], True means skip update
 
     Returns:
-        slerped rotation for time t-1 of shape [3, 3]
+        Rotation perturbation matrices of shape [L, 3, 3] (torch tensor)
     """
-    # interpolate FRAMES between one and next 
-    if not mask:
-        key_rots = scipy_R.from_matrix(np.stack([r_t, r_0], axis=0))
-    else:
-        key_rots = scipy_R.from_matrix(np.stack([r_t, r_t], axis=0))
+    if not isinstance(R_t, torch.Tensor):
+        R_t = torch.from_numpy(R_t).float()
+    if not isinstance(R_0, torch.Tensor):
+        R_0 = torch.from_numpy(R_0).float()
+    if not isinstance(mask, torch.Tensor):
+        mask = torch.tensor(mask, dtype=torch.bool)
 
-    key_times = [0,1]
+    # For masked positions, interpolate R_t -> R_t (no-op)
+    R_end = torch.where(mask[:, None, None], R_t, R_0)
 
-    interpolator = Slerp(key_times, key_rots)
-    alpha = np.array([1/t])
-    
-    # grab the interpolated FRAME 
-    interp_frame  = interpolator(alpha)
-    
-    # constructed rotation matrix which when applied YIELDS interpolated frame 
-    interp_rot = (interp_frame.as_matrix().squeeze() @ np.linalg.inv(r_t.squeeze()) )[None,...]
+    q_t = rotation_conversions.matrix_to_quaternion(R_t)
+    q_end = rotation_conversions.matrix_to_quaternion(R_end)
 
-    return interp_rot
+    alpha = 1.0 / t
+    q_interp = quaternion_slerp(q_t, q_end, alpha)
+    Interp_frame = rotation_conversions.quaternion_to_matrix(q_interp)
 
-def slerp_update_vectorized(R_t, R_0, t, mask=0):
-    """vectorized version of slerp_update. Not really much faster..."""
-
-    Interp_frame = np.full(R_t.shape, np.nan)
-    key_times = [0,1]
-    alpha = np.array([1/t])
-
-    for i in range(R_t.shape[0]):
-        if ( not mask[i] ):
-            key_rots = scipy_R.from_matrix(np.stack([R_t[i], R_0[i]], axis=0))
-        else:
-            key_rots = scipy_R.from_matrix(np.stack([R_t[i], R_t[i]], axis=0))
-        interpolator = Slerp(key_times, key_rots)
-
-        Interp_frame[i] = interpolator(alpha).as_matrix()
-
-    Interp_rot = np.einsum('...ij,...kj->...ik', Interp_frame, R_t)
+    # Compute relative rotation: Interp_frame @ R_t^T
+    Interp_rot = torch.einsum('...ij,...kj->...ik', Interp_frame, R_t)
 
     return Interp_rot
 
@@ -152,7 +135,7 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
             R_t[~diffusion_mask], R_0[~diffusion_mask], t,
             noise_level=noise_scale, mask=None, return_perturb=True, rotation_scaling=rotation_scaling)
     elif so3_type == "slerp":
-        vect_all_rot_transitions[~diffusion_mask] = slerp_update_vectorized(
+        all_rot_transitions[~diffusion_mask] = slerp_update_vectorized(
             R_t[~diffusion_mask], R_0[~diffusion_mask], t,
             mask=diffusion_mask[~diffusion_mask])
     else:
@@ -208,7 +191,6 @@ def get_next_ca(xt, px0, t, diffusion_mask, crd_scale, beta_schedule, alphabar_s
         noise_scale: scale factor for the noise being added
 
     """
-    get_allatom = ComputeAllAtomCoords().to(device=xt.device)
     L = len(xt)
 
     # bring to origin after global alignment (when don't have a motif) or replace input motif and bring to origin, and then scale 
@@ -456,58 +438,51 @@ class Denoise():
     def idx2steps(self):
         return self.decode_scheduler.idx2steps.numpy()
 
-    @staticmethod 
+    @staticmethod
     def get_dynamic_mu_sigma(chi_t, chi_0, T, t, chi_beta_T, beta_0, schedule_type='cosine'):
         """
-        Given currente chis, prediction of chi0, dynamic T, current t, and chi_beta_T schedules, 
-        sample new angles 
-        
-        Need to make this faster probably.
+        Given current chis, prediction of chi0, dynamic T, current t, and chi_beta_T schedules,
+        sample new angles.
+
+        Vectorized: groups by unique T values and computes each schedule once
+        instead of per-element.
         """
         t_idx = t-1
         assert t > 1 # t must be 2+ to do this
         assert len(chi_t) == len(chi_0)
-        
+
         max_t = max(chi_beta_T.keys())
-        betas_t = torch.full_like(chi_t, float('nan'))
-        abars_t = torch.full_like(chi_t, float('nan'))
-        abars_t_minus1 = torch.full_like(chi_t, float('nan')) 
-        
-        for i,_ in enumerate(chi_t):
-            T_for_this_chi = T[i]
-            
-            # make sure T is in domain of chi_beta_T
-            # if we choose max T, it's clearly a masked residue and doesn't matter anyway 
-            cur_T = min(T_for_this_chi, max_t)
+        betas_t = torch.zeros_like(chi_t)
+        abars_t = torch.zeros_like(chi_t)
+        abars_t_minus1 = torch.zeros_like(chi_t)
 
-            if t <= cur_T: # it's a valid position to find a beta for 
-                # get custom schedules for this amino acid based on its T 
-                beta_T = chi_beta_T[int(cur_T)]
+        # Clamp T values to valid domain
+        T_clamped = T.clone()
+        T_clamped[T_clamped > max_t] = max_t
 
-                beta_schedule, alpha_schedule, abar_schedule = get_beta_schedule(cur_T, 
-                                                                                 beta_0, 
-                                                                                 beta_T, 
-                                                                                 schedule_type)
-                
-                betas_t[i] = beta_schedule[t_idx]
-                abars_t[i] = abar_schedule[t_idx]
-                abars_t_minus1[i] = abar_schedule[t_idx-1]
+        # Group by unique T and compute schedule once per group
+        for cur_T in torch.unique(T_clamped):
+            cur_T_int = int(cur_T.item())
+            mask = (T_clamped == cur_T) & (t <= cur_T)
+            if not mask.any():
+                continue
+            beta_T = chi_beta_T[cur_T_int]
+            beta_schedule, alpha_schedule, abar_schedule = get_beta_schedule(
+                cur_T_int, beta_0, beta_T, schedule_type)
+            betas_t[mask] = beta_schedule[t_idx]
+            abars_t[mask] = abar_schedule[t_idx]
+            abars_t_minus1[mask] = abar_schedule[t_idx - 1]
 
-            else: # it's a position who will be masked so beta doesn't matter 
-                betas_t[i] = 0
-                abars_t[i] = 0
-                abars_t_minus1[i] = 0
+        # Positions where t > cur_T remain 0 (already initialized)
 
-
-        
-        # Now that we have abars and betas, create mu and sigma for all angles 
+        # Now that we have abars and betas, create mu and sigma for all angles
         variance = ((1 - abars_t_minus1)/(1-abars_t))*betas_t
-        
+
         a = (torch.sqrt(abars_t_minus1)*betas_t)/(1-abars_t)*chi_0
         b = (torch.sqrt(1-betas_t)*(1-abars_t_minus1)/(1-abars_t))*chi_t
-        
+
         mean = a+b
-        
+
         return mean, variance
 
     def reveal_residues(self, seq_t, seq_px0, px0, t):
