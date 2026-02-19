@@ -12,6 +12,7 @@ RFantibody is a pipeline for the structure-based design of _de novo_ antibodies 
 The RFantibody pipeline is described in detail in [this preprint](https://www.biorxiv.org/content/10.1101/2024.03.14.585103v1)
 
 # Table of Contents
+- [GPU Performance Optimizations](#gpu-performance-optimizations)
 - [Requirements](#requirements)
 - [Downloading Weights](#downloading-weights)
 - [Installation](#installation)
@@ -39,6 +40,18 @@ The RFantibody pipeline is described in detail in [this preprint](https://www.bi
 - [Quiver Files](#quiver-files)
 - [Conclusion](#conclusion)
 
+
+# GPU Performance Optimizations
+
+This fork includes GPU performance optimizations to the RFdiffusion inference pipeline, targeting the denoising loop hot path. Key changes:
+
+- **Vectorized SLERP**: Per-residue scipy loops replaced with batched quaternion interpolation in pure torch
+- **Precomputed per-step constants**: g(t) drift coefficients and sigma index lookups computed once at initialization instead of every denoising step
+- **Gram-Schmidt re-orthogonalization**: Replaces SVD for rotation matrix correction (faster for near-orthogonal matrices)
+- **CPU-GPU transfer elimination**: Torsion lookup tables moved to GPU, unnecessary `.cpu()` calls removed, `nan_to_num` replaces sync-inducing `isnan().any()` checks
+- **Dead code removal**: Unused single-residue functions and per-element Python loops removed
+
+All optimizations are numerically equivalent to the original -- the existing test suite passes without changes to reference outputs. See [docs/GPU_OPTIMIZATIONS.md](docs/GPU_OPTIMIZATIONS.md) for full technical details.
 
 # Requirements
 
