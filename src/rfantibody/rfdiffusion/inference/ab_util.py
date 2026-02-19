@@ -569,10 +569,12 @@ def featurize(item,
 
     ## alpha_t ##
     #############
-    # get_torsions indexes into CPU-resident lookup tables (TOR_INDICES, etc.)
-    # so inputs must be on CPU for this call
-    seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L).cpu()
-    alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1,L,27,3).cpu(), seq_tmp, TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES)
+    # Move small lookup tables to the same device as xyz_t (avoids CPU round-trip)
+    _tor_idx = TOR_INDICES.to(device)
+    _tor_flip = TOR_CAN_FLIP.to(device)
+    _ref_ang = REF_ANGLES.to(device)
+    seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
+    alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1,L,27,3), seq_tmp, _tor_idx, _tor_flip, _ref_ang)
     alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
     alpha[torch.isnan(alpha)] = 0.0
     alpha = alpha.reshape(1,-1,L,10,2)

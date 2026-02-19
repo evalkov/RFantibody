@@ -393,15 +393,12 @@ class IGSO3():
     def sigma_idx(self, sigma):
         """Calculates the index for discretized sigma during IGSO(3) initialization.
 
-        Accepts numpy arrays (used at init time) or torch tensors (used in hot loop).
+        Uses numpy digitize to avoid GPU sync (.item()) on the torch path.
         """
         if isinstance(sigma, np.ndarray):
             return np.digitize(sigma, self.discrete_sigma) - 1
-        # torch path – used in the per-step hot loop
-        if not isinstance(sigma, torch.Tensor):
-            sigma = torch.tensor(sigma)
-        return torch.searchsorted(self._discrete_sigma, sigma.float().reshape(-1)).clamp(
-            max=len(self._discrete_sigma) - 1).item()
+        # Convert to Python float and use numpy (avoids GPU sync for torch tensors)
+        return int(np.digitize(float(sigma), self.discrete_sigma) - 1)
 
     def t_to_idx(self, t):
         """Helper function to go from discrete time index t to corresponding sigma_idx.
@@ -619,93 +616,6 @@ class IGSO3():
 
         return (perturbed_crds.transpose(1, 0, 2, 3),   # [L, T, 3, 3]
                 R_perturbed.transpose(1, 0, 2, 3))
-
-    def reverse_sample(self, r_t, r_0, t, noise_level, mask=None, rotation_scaling=None):
-        """reverse_sample uses an approximation to the IGSO3 score to sample
-        a rotation at the previous time step.
-        
-        Roughly - this update follows the reverse time SDE for Reimannian
-        manifolds proposed by de Bortoli et al. Theorem 1 [1]. But with an
-        approximation to the score based on the prediction of R0.
-        Unlike in reference [1], this diffusion on SO(3) relies on geometric
-        variance schedule.  Specifically we follow [2] (appendix C) and assume
-            sigma_t = sigma_min * (sigma_max / sigma_min)^{t/T},
-        for time step t.  When we view this as a discretization  of the SDE
-        from time 0 to 1 with step size (1/T).  Following Eq. 5 and Eq. 6, 
-        this maps on to the forward  time SDEs
-            dx = g(t) dBt [FORWARD]
-        and 
-            dx = g(t)^2 score(xt, t)dt + g(t) B't, [REVERSE]
-        where g(t) = sigma_t * sqrt(2 * log(sigma_max/ sigma_min)), and Bt and
-        B't are Brownian motions. The formula for g(t) obtains from equation 9
-        of [2], from which this sampling function may be generalized to
-        alternative noising schedules.
-        Args:
-            r_t: noisy rotation of shape [3, 3]
-            r_0: prediction of un-noised rotation
-            t: integer time step
-            noise_level: scaling on the noise added when obtaining sample
-                (preliminary performance seems empirically better with noise 
-                level=0.5)
-            mask: whether the residue is to be updated.  A value of 1 means the
-                rotation is not updated from r_t.  A value of 0 means the
-                rotation is updated.
-        Return:
-            sampled rotation matrix for time t-1 of shape [3, 3]
-        Reference:
-        [1] De Bortoli, V., Mathieu, E., Hutchinson, M., Thornton, J., Teh, Y.
-        W., & Doucet, A. (2022). Riemannian score-based generative modeling.
-        arXiv preprint arXiv:2202.02763.
-        [2] Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A., Ermon, S.,
-        & Poole, B. (2020). Score-based generative modeling through stochastic
-        differential equations. arXiv preprint arXiv:2011.13456.
-        """
-        # NB this has been written for 1-indexed t, so no need for t_idx
-
-        # compute rotation vector corresponding to prediction of how r_t goes to r_0
-        r_0, r_t = torch.tensor(r_0), torch.tensor(r_t)
-        r_0t = torch.einsum('ij,kj->ik', r_t, r_0)
-        r_0t_rotvec = torch.tensor(scipy_R.from_matrix(
-            r_0t.cpu().numpy()).as_rotvec()).to(r_0.device)
-
-        # Approximate the score based on the prediction of R0.
-        # This approximation would be exactly equal to the conditional score
-        # grad_{rt} \log p(r_t |r_0) if the prediction of r_0 were exactly
-        # equal to r_0.  While this will not be the case in practice, the below
-        # approximation puts the magnitude score_approx on the appropriate
-        # scale as a function of variance at time t.  Additionally, scaling
-        # implicitly provides a roughly linear scaling in the size of the 
-        # update of the  rotation with the distance of r_0 to 
-        omega = torch.linalg.norm(r_0t_rotvec).numpy()
-        score_approx = r_0t_rotvec*self.score_norm(t, omega)/omega  
-
-        # Compute scaling for score and sampled noise (following Eq 6 of [2])
-        continuous_t = t/self.T
-        rot_g = self.g(continuous_t).to(score_approx.device)
-
-        # Sample and scale noise to add to the rotation perturbation in the
-        # SO(3) tangent space.  Since IG-SO(3) is the Brownian motion on SO(3)
-        # (up to a deceleration of time by a factor of two), for small enough 
-        # time-steps, this is equivalent to perturbing r_t with IG-SO(3) noise.
-        # See e.g. Algorithm 1 of De Bortoli et al.
-        z = np.random.normal(size=(3))
-        z = torch.Tensor(
-            z.reshape(3)).to(score_approx.device)
-        z *= noise_level # scale down added noise by noise_level
-
-        # sample perturbation from discretized SDE (following eq. 6 of [2])
-        if rotation_scaling is None:
-            perturb_rotvec = (rot_g ** 2) * self.step_size * score_approx + rot_g * np.sqrt(self.step_size) * z
-        else:
-            perturb_rotvec = (rot_g ** 2) * self.step_size * score_approx * 0.5 * rotation_scaling
-
-        # Mask perturbation if residue is masked
-        if mask is not None: perturb_rotvec *= (1-mask.long())
-        # Convert perturbation to a rotation matrix and apply to r_t
-        perturb = rotation_conversions.axis_angle_to_matrix(perturb_rotvec)
-        interp_rot = torch.einsum('ij,jk->ik', perturb, r_t) # interp_rot represents the sampled r_t-1
-        return interp_rot
-
 
     def reverse_sample_vectorized(self, R_t, R_0, t, noise_level, mask=None, return_perturb=False, rotation_scaling=None):
         """Vectorized version of reverse_sample() — pure torch, no scipy/numpy."""

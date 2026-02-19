@@ -347,8 +347,9 @@ class DecodeSchedule():
             for i in range(N):
                 if i == 0:
                     # sample a random residue which hasn't been decoded yet
-                    first_idx = np.random.choice(torch.arange(L)[~self.visible])
-                    decode_list.append(int(first_idx))
+                    candidates = torch.where(~self.visible)[0]
+                    first_idx = candidates[torch.randint(len(candidates), (1,))].item()
+                    decode_list.append(first_idx)
                     self.visible[first_idx] = True
                     self.T[first_idx] = t_idx + 1
                     continue
@@ -486,7 +487,7 @@ class Denoise():
 
         # Group by unique T and compute schedule once per group
         for cur_T in torch.unique(T_clamped):
-            cur_T_int = int(cur_T.item())
+            cur_T_int = int(cur_T)
             mask = (T_clamped == cur_T) & (t <= cur_T)
             if not mask.any():
                 continue
@@ -779,10 +780,8 @@ class Denoise():
         if not diffusion_mask == None:
             Ca_grads[diffusion_mask,:] = 0
 
-        # check for NaN's 
-        if torch.isnan(Ca_grads).any():
-            print('WARNING: NaN in potential gradients, replacing with zero grad.')
-            Ca_grads[:] = 0
+        # Replace NaN gradients with zero (avoids GPU sync from .any() check)
+        Ca_grads = torch.nan_to_num(Ca_grads, nan=0.0)
 
         return Ca_grads
 
