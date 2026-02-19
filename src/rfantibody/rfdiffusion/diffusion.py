@@ -318,6 +318,29 @@ class IGSO3():
         self._score_norm_table = torch.from_numpy(
             self.igso3_vals['score_norm']).float()
 
+        # Device cache for GPU-resident tables (lazily moved on first use)
+        self._cached_device = None
+
+        # Precompute t_to_idx mapping for integer timesteps 1..T
+        # (avoids sigma_idx → searchsorted → .item() GPU sync per step)
+        self._t_to_idx_table = {}
+        for t_int in range(1, self.T + 1):
+            ct = t_int / self.T
+            sigma_val = self.sigma(ct)
+            self._t_to_idx_table[t_int] = self.sigma_idx(sigma_val)
+
+        # Precompute g(t) for integer timesteps 1..T (avoids autograd per step)
+        ct = torch.arange(1, self.T + 1, dtype=torch.float64) / self.T
+        sigma_vals = self._sigma_vec(ct)
+        if self.schedule == 'linear':
+            sigma_derivs = self.min_b + ct * (self.max_b - self.min_b)
+        elif self.schedule == 'exponential':
+            log_ratio = math.log10(self.max_sigma) - math.log10(self.min_sigma)
+            sigma_derivs = sigma_vals * math.log(10) * log_ratio
+        else:
+            raise ValueError(f'Unrecognized schedule {self.schedule}')
+        self._g_table = torch.sqrt(2 * sigma_vals * sigma_derivs).float()
+
     def _calc_igso3_vals(self, L=2000):
         """_calc_igso3_vals computes numerical approximations to the
         relevant analytically intractable functionals of the igso3
@@ -383,9 +406,13 @@ class IGSO3():
     def t_to_idx(self, t):
         """Helper function to go from discrete time index t to corresponding sigma_idx.
 
+        Uses precomputed table for integer timesteps (avoids GPU sync).
+
         Args:
-            t: time index (integer between 1 and 200)
+            t: time index (integer between 1 and T)
         """
+        if t in self._t_to_idx_table:
+            return self._t_to_idx_table[t]
         continuous_t = t / self.T
         return self.sigma_idx(self.sigma(continuous_t))
 
@@ -407,23 +434,49 @@ class IGSO3():
         else:
             raise ValueError(f'Unrecognize schedule {self.schedule}')
 
+    def _sigma_vec(self, t):
+        """Vectorized sigma computation for a tensor of t values (used for precomputation)."""
+        if self.schedule == 'linear':
+            return self.min_sigma + t * self.min_b + 0.5 * t**2 * (self.max_b - self.min_b)
+        elif self.schedule == 'exponential':
+            log_sigma = t * math.log10(self.max_sigma) + (1 - t) * math.log10(self.min_sigma)
+            return 10 ** log_sigma
+        else:
+            raise ValueError(f'Unrecognized schedule {self.schedule}')
+
+    def _ensure_device(self, device):
+        """Move lookup tables to the given device once, then cache."""
+        if self._cached_device != device:
+            self._discrete_omega = self._discrete_omega.to(device)
+            self._discrete_sigma = self._discrete_sigma.to(device)
+            self._score_norm_table = self._score_norm_table.to(device)
+            self._g_table = self._g_table.to(device)
+            self._cached_device = device
+
     def g(self, t):
         """g returns the drift coefficient at time t
 
-        since 
+        Uses precomputed table for discrete timesteps (avoids autograd overhead).
+        Falls back to autograd for non-standard t values.
+
+        since
             sigma(t)^2 := \int_0^t g(s)^2 ds,
-        for arbitrary sigma(t) we invert this relationship to compute 
+        for arbitrary sigma(t) we invert this relationship to compute
             g(t) = sqrt(d/dt sigma(t)^2).
-        
+
         Args:
             t: scalar time between 0 and 1
-        
+
         Returns:
-            drift cooeficient as a scalar.
+            drift coefficient as a scalar.
         """
-        t = torch.tensor(t, requires_grad=True)
-        sigma_sqr = self.sigma(t)**2
-        grads = torch.autograd.grad(sigma_sqr.sum(), t)[0]
+        t_int = round(float(t) * self.T)
+        if 1 <= t_int <= self.T and abs(float(t) - t_int / self.T) < 1e-9:
+            return self._g_table[t_int - 1]
+        # Fallback to autograd for non-standard t values
+        t_tensor = torch.tensor(t, requires_grad=True)
+        sigma_sqr = self.sigma(t_tensor)**2
+        grads = torch.autograd.grad(sigma_sqr.sum(), t_tensor)[0]
         return torch.sqrt(grads)
 
 
@@ -470,8 +523,9 @@ class IGSO3():
             score_norm as torch tensor with same shape as omega
         """
         sigma_idx = self.t_to_idx(t)
-        x = self._discrete_omega.to(omega.device)
-        y = self._score_norm_table[sigma_idx].to(omega.device)
+        self._ensure_device(omega.device)
+        x = self._discrete_omega
+        y = self._score_norm_table[sigma_idx]
         omega_clamped = omega.clamp(x[0], x[-1])
         idx = torch.searchsorted(x, omega_clamped).clamp(1, len(x) - 1)
         slope = (omega_clamped - x[idx - 1]) / (x[idx] - x[idx - 1])

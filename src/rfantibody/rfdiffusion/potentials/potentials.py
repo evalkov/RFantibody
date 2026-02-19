@@ -1,8 +1,12 @@
+import logging
+
 import numpy as np
 import torch
 from icecream import ic
 
 from rfantibody.rfdiffusion.util import generate_Cbeta
+
+_log = logging.getLogger(__name__)
 
 
 class Potential:
@@ -149,7 +153,8 @@ class binder_ncontacts(Potential):
         denominator = torch.pow(divide_by_r_0,12)
         binder_ncontacts = (1 - numerator) / (1 - denominator)
         
-        print("BINDER CONTACTS:", binder_ncontacts.sum())
+        if _log.isEnabledFor(logging.DEBUG):
+            _log.debug("BINDER CONTACTS: %s", binder_ncontacts.sum())
         #Potential value is the average of both radii of gyration (is avg. the best way to do this?)
         return self.weight * binder_ncontacts.sum()
 
@@ -195,7 +200,8 @@ class dimer_ncontacts(Potential):
         #Potential is the sum of values in the tensor
         target_ncontacts = target_ncontacts.sum()
         
-        print("DIMER NCONTACTS:", (binder_ncontacts+target_ncontacts)/2)
+        if _log.isEnabledFor(logging.DEBUG):
+            _log.debug("DIMER NCONTACTS: %s", (binder_ncontacts+target_ncontacts)/2)
         #Returns average of n contacts withiin monomer 1 and monomer 2
         return self.weight * (binder_ncontacts+target_ncontacts)/2
 
@@ -234,7 +240,8 @@ class interface_ncontacts(Potential):
         #Potential is the sum of values in the tensor
         interface_ncontacts = interface_ncontacts.sum()
 
-        print("INTERFACE CONTACTS:", interface_ncontacts.sum())
+        if _log.isEnabledFor(logging.DEBUG):
+            _log.debug("INTERFACE CONTACTS: %s", interface_ncontacts.sum())
 
         return self.weight * interface_ncontacts
 
@@ -468,13 +475,13 @@ def lj_grad(dgram, r_min,p1=6,p2=12):
     return -p2 * r_min**p1*(r_min**p1-dgram**p1) / (dgram**(p2+1))
 
 def mask_expand(mask, n=1):
-    mask_out = mask.clone()
+    """Dilate a 1D boolean mask by n positions in each direction."""
     assert mask.ndim == 1
-    for i in torch.where(mask)[0]:
-        for j in range(i-n, i+n+1):
-            if j >= 0 and j < len(mask):
-                mask_out[j] = True
-    return mask_out
+    kernel_size = 2 * n + 1
+    dilated = torch.nn.functional.max_pool1d(
+        mask.float().unsqueeze(0).unsqueeze(0),
+        kernel_size, stride=1, padding=n)
+    return dilated.squeeze().bool()
 
 def contact_energy(dgram, d_0, r_0):
     divide_by_r_0 = (dgram - d_0) / r_0

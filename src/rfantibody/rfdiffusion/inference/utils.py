@@ -76,6 +76,39 @@ def slerp_update_vectorized(R_t, R_0, t, mask=0):
 
     return Interp_rot
 
+def _reorthogonalize(R):
+    """Modified Gram-Schmidt re-orthogonalization ensuring proper rotations (det=+1).
+
+    Cross product for third column guarantees det=+1 without a determinant check.
+    Faster than SVD for near-orthogonal matrices (e.g. from rigid_from_3_points).
+
+    Args:
+        R: rotation matrices of shape (..., 3, 3)
+
+    Returns:
+        Re-orthogonalized rotation matrices of same shape
+    """
+    c0 = R[..., :, 0]
+    c1 = R[..., :, 1]
+    c0 = c0 / torch.linalg.norm(c0, dim=-1, keepdim=True)
+    c1 = c1 - (c0 * c1).sum(dim=-1, keepdim=True) * c0
+    c1 = c1 / torch.linalg.norm(c1, dim=-1, keepdim=True)
+    c2 = torch.cross(c0, c1, dim=-1)
+    return torch.stack([c0, c1, c2], dim=-1)
+
+
+# Module-level cache for expanded identity matrices (avoids re-allocation per step)
+_identity_cache = {}
+
+
+def _get_identity_expanded(L, device):
+    """Return a clone of a cached (L, 3, 3) identity expansion."""
+    key = (L, device)
+    if key not in _identity_cache:
+        _identity_cache[key] = torch.eye(3, device=device).unsqueeze(0).expand(L, 3, 3)
+    return _identity_cache[key].clone()
+
+
 def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=1., rotation_scaling=None):
     """get_next_frames gets updated frames using either SLERP or the IGSO(3) + score_based reverse diffusion.
     
@@ -110,23 +143,14 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
 
     R_t, Ca_t = rigid_from_3_points(N_t, Ca_t, C_t)
 
-    # Re-orthogonalize via SVD (replaces scipy_R round-trip)
-    # Determinant correction ensures proper rotations (det=+1), not reflections
-    R_0_sq = R_0.squeeze()
-    U0, S0, Vh0 = torch.linalg.svd(R_0_sq)
-    d0 = torch.ones_like(S0)
-    d0[..., -1] = torch.sign(torch.linalg.det(U0 @ Vh0))
-    R_0 = U0 @ (d0[..., None] * Vh0)
-
-    R_t_sq = R_t.squeeze()
-    Ut, St, Vht = torch.linalg.svd(R_t_sq)
-    dt = torch.ones_like(St)
-    dt[..., -1] = torch.sign(torch.linalg.det(Ut @ Vht))
-    R_t = Ut @ (dt[..., None] * Vht)
+    # Re-orthogonalize via Gram-Schmidt (faster than SVD for near-orthogonal matrices)
+    # Cross product guarantees det=+1 without determinant check
+    R_0 = _reorthogonalize(R_0.squeeze())
+    R_t = _reorthogonalize(R_t.squeeze())
 
     L = R_t.shape[0]
     device = R_t.device
-    all_rot_transitions = torch.eye(3, device=device).unsqueeze(0).expand(L, 3, 3).clone()
+    all_rot_transitions = _get_identity_expanded(L, device)
 
     # Sample next frame for each residue
     if so3_type == "igso3":
@@ -535,19 +559,19 @@ class Denoise():
 
         # build 27-atom representations
         if not xt.shape[1] == 27:
-            xt_full = torch.full((L,27,3),np.nan).float()
+            xt_full = torch.full((L,27,3),np.nan, device=xt.device).float()
             xt_full[:,:14,:] = xt[:,:14]
 
 
         if not px0.shape[1] == 27:
-            px0_full = torch.full((L,27,3),np.nan).float()
+            px0_full = torch.full((L,27,3),np.nan, device=px0.device).float()
             px0_full[:,:14,:] = px0[:,:14]
 
 
 
-        # there is no situation where we should have any NaN BB crds here  
-        mask = torch.full((L, 27), False)
-        mask[:,:14] = True 
+        # there is no situation where we should have any NaN BB crds here
+        mask = torch.full((L, 27), False, device=xt.device)
+        mask[:,:14] = True
 
         ### Calcualte torsions and interpolate between them 
 
@@ -848,8 +872,8 @@ class Denoise():
             if self.seq_diffuser:
                 raise NotImplementedError('Sidechain diffusion and sequence diffusion cannot be performed at the same time')
 
-            seq_t = torch.argmax(seq_t, dim=-1).cpu() # [L]
-            pseq0 = torch.argmax(pseq0, dim=-1).cpu() # [L]
+            seq_t = torch.argmax(seq_t, dim=-1) # [L]
+            pseq0 = torch.argmax(pseq0, dim=-1) # [L]
             torsions_next, seq_next = self.get_next_torsions(xt, px0, seq_t, pseq0, t, diffusion_mask, noise_scale = self.noise_scale_torsion)
             # build full atom representation with the new torsions but the current seq
             _, fullatom_next =  get_allatom(seq_t[None], frames_next[None], torsions_next[None])
@@ -869,8 +893,8 @@ class Denoise():
                 zeros = torch.zeros(L,2)
                 seq_next = torch.cat((seq_next, zeros), dim=-1) # [L,22]
             else:
-                seq_t = torch.argmax(seq_t, dim=-1).cpu() # [L]
-                pseq0 = torch.argmax(pseq0, dim=-1).cpu() # [L]
+                seq_t = torch.argmax(seq_t, dim=-1) # [L]
+                pseq0 = torch.argmax(pseq0, dim=-1) # [L]
                 seq_next = self.reveal_residues(seq_t, pseq0, px0, t)
                 seq_next = torch.nn.functional.one_hot(
                         seq_next, num_classes=22).float()
